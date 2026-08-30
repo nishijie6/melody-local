@@ -37,11 +37,11 @@ Thanks for improving 音澜. Keep changes focused, preserve offline behavior, an
 Before opening a pull request, run:
 
 ```bash
-./gradlew testDebugUnitTest assembleDebug lintDebug
+./gradlew testReleaseUnitTest lintRelease assembleRelease assembleDebugAndroidTest
 ./gradlew connectedDebugAndroidTest
 ```
 
-The project currently has JVM tests for playback queue policies, bounded and atomic LRC handling, model validation and playlist-name rules. Android instrumentation tests cover MediaSession mode switching, Room migrations, permission flows and Compose UI behavior. UI and MediaSession changes should still be checked on an Android 13–16 device or emulator.
+The project currently has JVM tests for playback, bounded and atomic LRC handling, media-operation policy and playlist rules. Android instrumentation tests cover MediaSession switching, Room migrations, MediaStore/Transformer output, permission flows and Compose/ViewModel behavior. Storage changes should be checked on API 26, 29 and 36 because each uses a different authorization path.
 
 ## Release signing
 
@@ -62,7 +62,8 @@ Never commit:
 - Keep the application offline unless a proposal explicitly changes the privacy model.
 - Preserve the current song and position when changing playback modes.
 - Keep playback-mode ownership in `MusicService`; use ExoPlayer shuffle/repeat policies instead of rewriting the active playlist.
-- Keep Room access behind `PlaylistRepository` and MediaStore access behind `MusicRepository`.
+- Keep Room and MediaStore mutations behind the repository/coordinator contracts; never delete a source file before copy verification and durable journal state.
+- Keep video access scoped to system-picker URIs. Do not inspect another app's private cache or add DRM/cache-circumvention code.
 - Add or update tests for pure policy and parser changes.
 - Update `README.md`, `ARCHITECTURE.md` and `CHANGELOG.md` when user-visible behavior changes.
 
@@ -71,4 +72,3 @@ Never commit:
 Describe the user-visible outcome, list verification commands and mention any behavior that still requires a real device. Small, logically complete commits are easier to review and bisect.
 
 Security reports do not belong in public issues. Follow [SECURITY.md](SECURITY.md).
-

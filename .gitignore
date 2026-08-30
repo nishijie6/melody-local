@@ -10,6 +10,7 @@ local.properties
 /keystore.properties
 /release-signing/
 /release/*.apk
+/release/*.sha256
 *.jks
 *.keystore
 *.log

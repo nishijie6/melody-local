@@ -1,6 +1,8 @@
 package com.melody.local.ui
 
 import android.app.Application
+import android.app.PendingIntent
+import android.content.Intent
 import android.net.Uri
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
@@ -16,6 +18,14 @@ import com.melody.local.data.Song
 import com.melody.local.lyrics.LyricLine
 import com.melody.local.lyrics.LyricsStore
 import com.melody.local.lyrics.ParsedLyrics
+import com.melody.local.media.MediaAuthorizationRequest
+import com.melody.local.media.MediaOperationState
+import com.melody.local.media.MediaOperationSummary
+import com.melody.local.media.PlaylistMovePreview
+import com.melody.local.media.RelocationStep
+import com.melody.local.media.SongRelocationCoordinator
+import com.melody.local.media.VideoAudioExtractor
+import com.melody.local.media.VideoImportRequest
 import com.melody.local.playback.PlaybackController
 import com.melody.local.playback.PlaybackMode
 import com.melody.local.playback.PlaybackUiState
@@ -183,8 +193,64 @@ class MainViewModelInstrumentedTest {
         fixture.clear()
     }
 
+    @Test
+    fun videoImportUsesEditedMetadataPublishesProgressAndRejectsDuplicateWork() = runBlocking {
+        val extractor = FakeVideoAudioExtractor()
+        val fixture = Fixture(videoExtractor = extractor)
+        val source = Uri.fromFile(application.cacheDir.resolve("picked-video.mp4"))
+
+        fixture.viewModel.prepareVideoImport(source)
+        waitUntil { fixture.viewModel.videoImportDraft.value != null }
+        fixture.viewModel.importVideoAudio("Edited title", "Edited artist", "Edited album", true)
+        waitUntil { extractor.requests.size == 1 }
+        assertEquals("Edited title", extractor.requests.single().title)
+        assertEquals("Edited artist", extractor.requests.single().artist)
+        assertTrue(extractor.requests.single().extractArtwork)
+        waitUntil { fixture.viewModel.videoImportState.value is MediaOperationState.Processing }
+
+        fixture.viewModel.prepareVideoImport(source)
+        waitUntil { fixture.viewModel.videoImportDraft.value != null }
+        fixture.viewModel.importVideoAudio("Duplicate", "Artist", "Album", false)
+        delay(100)
+        assertEquals(1, extractor.requests.size)
+
+        extractor.state.value = MediaOperationState.Completed(
+            MediaOperationSummary(imported = 1, songId = 5L)
+        )
+        waitUntil { fixture.viewModel.videoImportState.value is MediaOperationState.Completed }
+        fixture.clear()
+    }
+
+    @Test
+    fun relocationStopsPlaybackPreventsDoubleStartAndKeepsPartialResultAfterDenial() = runBlocking {
+        val coordinator = FakeRelocationCoordinator(application)
+        val fixture = Fixture(relocation = coordinator)
+        fixture.viewModel.loadPlaylistMovePreview()
+        waitUntil { fixture.viewModel.playlistMovePreview.value?.songCount == 3 }
+
+        fixture.viewModel.startPlaylistMove("歌单汇总")
+        waitUntil { fixture.viewModel.playlistMoveState.value is MediaOperationState.Processing }
+        fixture.viewModel.startPlaylistMove("歌单汇总")
+        delay(100)
+        assertEquals(1, coordinator.startCalls)
+        assertEquals(1, fixture.player.stopCount)
+
+        coordinator.startGate.complete(Unit)
+        waitUntil { fixture.viewModel.authorizationRequest.value != null }
+        assertTrue(fixture.viewModel.playlistMoveState.value is MediaOperationState.AwaitingSystemAuthorization)
+        fixture.viewModel.resumePlaylistMove(false)
+        waitUntil { fixture.viewModel.playlistMoveState.value is MediaOperationState.Completed }
+        assertEquals(false, coordinator.lastAuthorizationGranted)
+        val summary = (fixture.viewModel.playlistMoveState.value as MediaOperationState.Completed).summary
+        assertEquals(2, summary.moved)
+        assertEquals(1, summary.cancelled)
+        fixture.clear()
+    }
+
     private inner class Fixture(
         music: FakeMusicLibrary = FakeMusicLibrary { emptyList() },
+        videoExtractor: VideoAudioExtractor? = null,
+        relocation: SongRelocationCoordinator? = null,
     ) {
         val playlists = FakePlaylistStore()
         val lyrics = FakeLyricsStore()
@@ -203,6 +269,8 @@ class MainViewModelInstrumentedTest {
                     playlists,
                     lyrics,
                     player,
+                    videoExtractor,
+                    relocation,
                 ) as T
             },
         )[MainViewModel::class.java]
@@ -245,6 +313,10 @@ class MainViewModelInstrumentedTest {
 
         override suspend fun addSong(playlistId: Long, songId: Long): Boolean = addResult
         override suspend fun removeSong(playlistId: Long, songId: Long) = Unit
+        override suspend fun getAllSongIds(): List<Long> = songIds.value.distinct()
+        override suspend fun remapSongIds(remaps: Map<Long, Long>) {
+            songIds.value = songIds.value.map { remaps[it] ?: it }
+        }
         override fun observeSongIds(playlistId: Long): Flow<List<Long>> {
             observedPlaylistIds += playlistId
             return songIds
@@ -265,15 +337,19 @@ class MainViewModelInstrumentedTest {
         override suspend fun delete(songId: Long) {
             deletedSongId = songId
         }
+        override suspend fun remap(oldSongId: Long, newSongId: Long) = Unit
     }
 
     private class FakePlaybackController : PlaybackController {
         val mutableState = MutableStateFlow(PlaybackUiState())
         override val state: StateFlow<PlaybackUiState> = mutableState
         var releaseCount = 0
+        var stopCount = 0
         override fun playQueue(songs: List<Song>, startIndex: Int) = Unit
         override fun togglePlayPause() = Unit
-        override fun stop() = Unit
+        override fun stop() {
+            stopCount++
+        }
         override fun seekTo(positionMs: Long) = Unit
         override fun seekToNext() = Unit
         override fun seekToPrevious() = Unit
@@ -281,6 +357,72 @@ class MainViewModelInstrumentedTest {
         override fun release() {
             releaseCount++
         }
+    }
+
+    private class FakeVideoAudioExtractor : VideoAudioExtractor {
+        val requests = mutableListOf<VideoImportRequest>()
+        val state = MutableStateFlow<MediaOperationState>(MediaOperationState.Idle)
+
+        override suspend fun enqueue(request: VideoImportRequest): Boolean {
+            if (state.value is MediaOperationState.Processing) return false
+            requests += request
+            state.value = MediaOperationState.Processing(request.title, 0, 1, 25)
+            return true
+        }
+
+        override suspend fun cancel() {
+            state.value = MediaOperationState.Cancelled()
+        }
+
+        override suspend fun currentState(): MediaOperationState = state.value
+    }
+
+    private class FakeRelocationCoordinator(
+        private val application: Application,
+    ) : SongRelocationCoordinator {
+        var startCalls = 0
+        var lastAuthorizationGranted: Boolean? = null
+        val startGate = CompletableDeferred<Unit>()
+
+        override suspend fun preview() = PlaylistMovePreview(3, 3_000L, 0)
+
+        override suspend fun start(
+            folderName: String,
+            onState: (MediaOperationState) -> Unit,
+        ): RelocationStep {
+            startCalls++
+            onState(MediaOperationState.Processing("song.mp3", 0, 3, 10))
+            startGate.await()
+            val waiting = MediaOperationState.AwaitingSystemAuthorization("需要系统授权", 1, 3)
+            onState(waiting)
+            val pendingIntent = PendingIntent.getActivity(
+                application,
+                91,
+                Intent(application, application.javaClass),
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+            )
+            return RelocationStep.AwaitingAuthorization(
+                MediaAuthorizationRequest(pendingIntent, waiting.message, 1, 3)
+            )
+        }
+
+        override suspend fun resume(
+            authorizationGranted: Boolean,
+            onState: (MediaOperationState) -> Unit,
+        ): RelocationStep {
+            lastAuthorizationGranted = authorizationGranted
+            val completed = MediaOperationState.Completed(
+                MediaOperationSummary(moved = 2, cancelled = if (authorizationGranted) 0 else 1)
+            )
+            onState(completed)
+            return RelocationStep.Finished(completed)
+        }
+
+        override suspend fun recover(onState: (MediaOperationState) -> Unit): RelocationStep? = null
+
+        override suspend fun cancel(
+            onState: (MediaOperationState) -> Unit,
+        ): MediaOperationState = MediaOperationState.Cancelled().also(onState)
     }
 
     private fun song(id: Long) = Song(
@@ -302,4 +444,3 @@ class MainViewModelInstrumentedTest {
         }
     }
 }
-

@@ -2,6 +2,36 @@
 
 All notable changes to this project are documented in this file.
 
+## 1.3.0 - 2026-08-31
+
+### Added
+
+- Added single-video selection through Android's system document picker, with persisted access to only the user-selected local file.
+- Added Media3 Transformer audio-only M4A export: AAC input can be remuxed, while other platform-decodable audio is converted to AAC.
+- Added editable video-import title, artist and album, plus optional first-frame artwork compressed to a maximum 1024-pixel edge.
+- Added a unique foreground WorkManager import with progress, cancellation, process-restart cleanup, explicit failure reasons and collision-safe output under `Music/音澜/视频提取/`.
+- Added “汇总歌单歌曲” to move the distinct union of playlist songs into an editable public `Music/音澜/<folder>/` destination.
+- Added same-volume MediaStore moves, verified cross-volume copy/delete, API 29 per-item consent, API 30+ write/delete batches of at most 2000 items, and Android 8–9 on-demand write permission.
+- Added Room v3 metadata overrides and a persistent relocation journal for prepared, copied, source-deleted and committed states.
+- Added 17 automated tests for media-operation rules, Room migration/remapping, metadata/journal persistence, ViewModel authorization/partial completion and real Transformer audio-only output/cancellation cleanup.
+
+### Changed
+
+- Raised the application version to `1.3.0` / Android `versionCode` 5.
+- `MusicRepository` and playback notifications now prefer local title, artist, album and artwork overrides created during video import.
+- CI now packages the Release and Android-test variants and runs instrumentation on API 26, 29 and 36.
+
+### Fixed
+
+- Playlist relationships, imported lyrics, private artwork and metadata now survive a MediaStore ID change caused by a verified cross-volume move.
+- A source song is never deleted when the destination size or SHA-256 differs, and a denied/cancelled operation safely removes copies whose source still exists.
+- Interrupted media operations now clean unpublished video exports and pre-delete song copies, or finish idempotent remapping when source deletion already completed.
+
+### Privacy
+
+- Video import does not request `READ_MEDIA_VIDEO`, scan private Bilibili storage, bypass sandboxing, decrypt caches or handle DRM-protected content.
+- The app continues to omit Android's `INTERNET` permission and performs all extraction, artwork and relocation work locally.
+
 ## 1.2.0 - 2026-08-30
 
 ### Added

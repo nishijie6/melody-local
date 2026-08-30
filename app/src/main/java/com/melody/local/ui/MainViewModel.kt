@@ -2,6 +2,7 @@ package com.melody.local.ui
 
 import android.app.Application
 import android.net.Uri
+import android.provider.OpenableColumns
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.melody.local.data.MusicRepository
@@ -11,12 +12,25 @@ import com.melody.local.data.PlaylistDatabase
 import com.melody.local.data.PlaylistRepository
 import com.melody.local.data.PlaylistStore
 import com.melody.local.data.PlaylistSummary
+import com.melody.local.data.RoomMoveJournalStore
+import com.melody.local.data.RoomSongMetadataStore
 import com.melody.local.data.Song
 import com.melody.local.lyrics.LyricsRepository
 import com.melody.local.lyrics.LyricsStore
 import com.melody.local.lyrics.ParsedLyrics
 import com.melody.local.playback.PlayerConnection
 import com.melody.local.playback.PlaybackController
+import com.melody.local.media.MediaAuthorizationRequest
+import com.melody.local.media.MediaOperationState
+import com.melody.local.media.MediaStoreSongRelocationCoordinator
+import com.melody.local.media.PlaylistMovePreview
+import com.melody.local.media.RelocationStep
+import com.melody.local.media.SongRelocationCoordinator
+import com.melody.local.media.VideoAudioExtractor
+import com.melody.local.media.VideoImportDraft
+import com.melody.local.media.VideoImportRequest
+import com.melody.local.media.WorkManagerVideoAudioExtractor
+import com.melody.local.media.defaultVideoTitle
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -35,6 +49,9 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 
 internal fun filterAndSortSongs(
     songs: List<Song>,
@@ -78,16 +95,21 @@ class MainViewModel internal constructor(
     private val playlistRepository: PlaylistStore,
     private val lyricsRepository: LyricsStore,
     val player: PlaybackController,
+    private val videoAudioExtractor: VideoAudioExtractor? = null,
+    private val songRelocationCoordinator: SongRelocationCoordinator? = null,
 ) : AndroidViewModel(application) {
-    constructor(application: Application) : this(
+    private constructor(application: Application, services: ProductionServices) : this(
         application = application,
-        musicRepository = MusicRepository(application),
-        playlistRepository = PlaylistRepository(
-            PlaylistDatabase.getInstance(application).playlistDao()
-        ),
-        lyricsRepository = LyricsRepository(application),
-        player = PlayerConnection(application),
+        musicRepository = services.musicRepository,
+        playlistRepository = services.playlists,
+        lyricsRepository = services.lyrics,
+        player = services.player,
+        videoAudioExtractor = services.videoExtractor,
+        songRelocationCoordinator = services.relocation,
     )
+
+    constructor(application: Application) : this(application, ProductionServices(application))
+
     val playback = player.state
 
     private val _allSongs = MutableStateFlow<List<Song>>(emptyList())
@@ -139,6 +161,44 @@ class MainViewModel internal constructor(
 
     private val _messages = MutableSharedFlow<String>(extraBufferCapacity = 4)
     val messages = _messages.asSharedFlow()
+
+    private val _videoImportDraft = MutableStateFlow<VideoImportDraft?>(null)
+    val videoImportDraft: StateFlow<VideoImportDraft?> = _videoImportDraft.asStateFlow()
+
+    private val _videoImportState = MutableStateFlow<MediaOperationState>(MediaOperationState.Idle)
+    val videoImportState: StateFlow<MediaOperationState> = _videoImportState.asStateFlow()
+
+    private val _playlistMovePreview = MutableStateFlow<PlaylistMovePreview?>(null)
+    val playlistMovePreview: StateFlow<PlaylistMovePreview?> = _playlistMovePreview.asStateFlow()
+
+    private val _playlistMoveState = MutableStateFlow<MediaOperationState>(MediaOperationState.Idle)
+    val playlistMoveState: StateFlow<MediaOperationState> = _playlistMoveState.asStateFlow()
+
+    private val _authorizationRequest = MutableStateFlow<MediaAuthorizationRequest?>(null)
+    val authorizationRequest: StateFlow<MediaAuthorizationRequest?> =
+        _authorizationRequest.asStateFlow()
+
+    private var videoMonitorJob: Job? = null
+    private var relocationJob: Job? = null
+
+    init {
+        if (videoAudioExtractor != null) monitorVideoImport(showCompletionMessage = false)
+        if (songRelocationCoordinator != null) {
+            relocationJob = viewModelScope.launch {
+                val recovered = runCatching {
+                    withContext(Dispatchers.IO) {
+                        songRelocationCoordinator.recover(::updateMoveState)
+                    }
+                }.getOrElse { error ->
+                    updateMoveState(
+                        MediaOperationState.Failed(error.message ?: "无法恢复上次的文件移动")
+                    )
+                    null
+                }
+                if (recovered != null) handleRelocationStep(recovered)
+            }
+        }
+    }
 
     fun refreshSongs() {
         if (_isLoading.value) return
@@ -215,6 +275,150 @@ class MainViewModel internal constructor(
         }
     }
 
+    fun prepareVideoImport(uri: Uri) {
+        viewModelScope.launch {
+            val displayName = withContext(Dispatchers.IO) {
+                getApplication<Application>().contentResolver.query(
+                    uri,
+                    arrayOf(OpenableColumns.DISPLAY_NAME),
+                    null,
+                    null,
+                    null,
+                )?.use { cursor ->
+                    if (cursor.moveToFirst()) cursor.getString(0) else null
+                }
+            }
+            _videoImportDraft.value = VideoImportDraft(
+                uri = uri,
+                suggestedTitle = defaultVideoTitle(displayName),
+            )
+        }
+    }
+
+    fun dismissVideoImportDraft() {
+        _videoImportDraft.value = null
+    }
+
+    fun importVideoAudio(
+        title: String,
+        artist: String,
+        album: String,
+        extractArtwork: Boolean,
+    ) {
+        val draft = _videoImportDraft.value ?: return
+        if (title.isBlank()) {
+            _messages.tryEmit("歌曲标题不能为空")
+            return
+        }
+        val extractor = videoAudioExtractor ?: return
+        viewModelScope.launch {
+            val enqueued = extractor.enqueue(
+                VideoImportRequest(
+                    uri = draft.uri,
+                    title = title.trim(),
+                    artist = artist.trim().ifBlank { "未知歌手" },
+                    album = album.trim().ifBlank { "视频提取" },
+                    extractArtwork = extractArtwork,
+                )
+            )
+            if (!enqueued) {
+                _messages.emit("已有视频音轨正在导入")
+                return@launch
+            }
+            _videoImportDraft.value = null
+            _videoImportState.value = MediaOperationState.Preparing("正在准备视频音轨…")
+            monitorVideoImport(showCompletionMessage = true)
+        }
+    }
+
+    fun cancelVideoImport() {
+        val extractor = videoAudioExtractor ?: return
+        viewModelScope.launch {
+            extractor.cancel()
+            _videoImportState.value = MediaOperationState.Cancelled()
+            _messages.emit("视频音轨导入已取消")
+        }
+    }
+
+    fun dismissVideoImportResult() {
+        if (_videoImportState.value.isTerminal()) _videoImportState.value = MediaOperationState.Idle
+    }
+
+    fun loadPlaylistMovePreview() {
+        val coordinator = songRelocationCoordinator ?: return
+        viewModelScope.launch {
+            _playlistMovePreview.value = null
+            _playlistMoveState.value = MediaOperationState.Preparing("正在统计歌单歌曲…")
+            runCatching { coordinator.preview() }
+                .onSuccess {
+                    _playlistMovePreview.value = it
+                    _playlistMoveState.value = MediaOperationState.Idle
+                }
+                .onFailure {
+                    _playlistMoveState.value = MediaOperationState.Failed(
+                        it.message ?: "无法统计歌单歌曲"
+                    )
+                }
+        }
+    }
+
+    fun startPlaylistMove(folderName: String) {
+        val coordinator = songRelocationCoordinator ?: return
+        if (_playlistMoveState.value.isBusy()) {
+            _messages.tryEmit("已有歌单歌曲汇总任务正在进行")
+            return
+        }
+        player.stop()
+        relocationJob = viewModelScope.launch {
+            val step = runCatching {
+                withContext(Dispatchers.IO) {
+                    coordinator.start(folderName, ::updateMoveState)
+                }
+            }.getOrElse { error ->
+                val failed = MediaOperationState.Failed(error.message ?: "汇总歌单歌曲失败")
+                updateMoveState(failed)
+                RelocationStep.Finished(failed)
+            }
+            handleRelocationStep(step)
+        }
+    }
+
+    fun resumePlaylistMove(authorizationGranted: Boolean) {
+        val coordinator = songRelocationCoordinator ?: return
+        _authorizationRequest.value = null
+        relocationJob = viewModelScope.launch {
+            val step = runCatching {
+                withContext(Dispatchers.IO) {
+                    coordinator.resume(authorizationGranted, ::updateMoveState)
+                }
+            }.getOrElse { error ->
+                val failed = MediaOperationState.Failed(error.message ?: "系统授权处理失败")
+                updateMoveState(failed)
+                RelocationStep.Finished(failed)
+            }
+            handleRelocationStep(step)
+        }
+    }
+
+    fun cancelPlaylistMove() {
+        val coordinator = songRelocationCoordinator ?: return
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) { coordinator.cancel(::updateMoveState) }
+            refreshSongs()
+        }
+    }
+
+    fun authorizationRequestLaunched() {
+        _authorizationRequest.value = null
+    }
+
+    fun dismissPlaylistMoveResult() {
+        if (_playlistMoveState.value.isTerminal()) {
+            _playlistMoveState.value = MediaOperationState.Idle
+            _playlistMovePreview.value = null
+        }
+    }
+
     fun importLyrics(songId: Long, uri: Uri) {
         viewModelScope.launch {
             runCatching { lyricsRepository.import(songId, uri) }
@@ -248,8 +452,93 @@ class MainViewModel internal constructor(
         )
     }
 
+    private fun monitorVideoImport(showCompletionMessage: Boolean) {
+        val extractor = videoAudioExtractor ?: return
+        videoMonitorJob?.cancel()
+        videoMonitorJob = viewModelScope.launch {
+            var lastState: MediaOperationState? = null
+            while (true) {
+                val state = runCatching { extractor.currentState() }
+                    .getOrElse { MediaOperationState.Failed(it.message ?: "无法读取导入进度") }
+                _videoImportState.value = state
+                if (state.isTerminal()) {
+                    if (state is MediaOperationState.Completed) refreshSongs()
+                    if (showCompletionMessage && state != lastState) {
+                        _messages.emit(
+                            when (state) {
+                                is MediaOperationState.Completed -> "视频音轨已导入到 Music/音澜/视频提取"
+                                is MediaOperationState.Failed -> state.message
+                                is MediaOperationState.Cancelled -> "视频音轨导入已取消"
+                                else -> ""
+                            }
+                        )
+                    }
+                    break
+                }
+                if (state is MediaOperationState.Idle) break
+                lastState = state
+                delay(400L)
+            }
+        }
+    }
+
+    private fun updateMoveState(state: MediaOperationState) {
+        _playlistMoveState.value = state
+    }
+
+    private suspend fun handleRelocationStep(step: RelocationStep) {
+        when (step) {
+            is RelocationStep.AwaitingAuthorization -> _authorizationRequest.value = step.request
+            is RelocationStep.Finished -> {
+                when (val state = step.state) {
+                    is MediaOperationState.Completed -> {
+                        refreshSongs()
+                        val summary = state.summary
+                        _messages.emit(
+                            "汇总完成：移动 ${summary.moved} 首，跳过 ${summary.skipped} 首，" +
+                                "失败 ${summary.failed} 首，取消 ${summary.cancelled} 首"
+                        )
+                    }
+                    is MediaOperationState.Cancelled -> {
+                        refreshSongs()
+                        _messages.emit("歌单歌曲汇总已取消，已完成部分会保留")
+                    }
+                    is MediaOperationState.Failed -> _messages.emit(state.message)
+                    else -> Unit
+                }
+            }
+        }
+    }
+
+    private fun MediaOperationState.isBusy(): Boolean =
+        this is MediaOperationState.Preparing ||
+            this is MediaOperationState.Processing ||
+            this is MediaOperationState.AwaitingSystemAuthorization
+
+    private fun MediaOperationState.isTerminal(): Boolean =
+        this is MediaOperationState.Completed ||
+            this is MediaOperationState.Failed ||
+            this is MediaOperationState.Cancelled
+
     override fun onCleared() {
         player.release()
         super.onCleared()
     }
+}
+
+private class ProductionServices(application: Application) {
+    private val database = PlaylistDatabase.getInstance(application)
+    private val metadata = RoomSongMetadataStore(database.songStateDao())
+    val playlists = PlaylistRepository(database.playlistDao())
+    val lyrics = LyricsRepository(application)
+    val player = PlayerConnection(application)
+    val musicRepository = MusicRepository(application, metadata)
+    val videoExtractor = WorkManagerVideoAudioExtractor(application)
+    val relocation = MediaStoreSongRelocationCoordinator(
+        context = application,
+        playlists = playlists,
+        metadata = metadata,
+        lyrics = lyrics,
+        journal = RoomMoveJournalStore(database.songStateDao()),
+    )
 }

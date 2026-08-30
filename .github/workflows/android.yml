@@ -35,14 +35,14 @@ jobs:
       - name: Make Gradle wrapper executable
         run: chmod +x gradlew
 
-      - name: Run tests, lint and Debug build
-        run: ./gradlew --no-daemon testDebugUnitTest lintDebug assembleDebug
+      - name: Run release tests, lint, R8 and Android test packaging
+        run: ./gradlew --no-daemon testReleaseUnitTest lintRelease assembleRelease assembleDebugAndroidTest
 
-      - name: Upload Debug APK
+      - name: Upload unsigned Release APK
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: melody-local-debug
-          path: app/build/outputs/apk/debug/app-debug.apk
+          name: melody-local-release-unsigned
+          path: app/build/outputs/apk/release/app-release-unsigned.apk
           if-no-files-found: error
 
   instrumented-tests:
@@ -51,7 +51,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        api-level: [26, 36]
+        api-level: [26, 29, 36]
 
     steps:
       - name: Check out repository
@@ -81,4 +81,3 @@ jobs:
           arch: x86_64
           disable-animations: true
           script: ./gradlew --no-daemon connectedDebugAndroidTest
-

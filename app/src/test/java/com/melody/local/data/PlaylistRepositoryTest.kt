@@ -75,7 +75,7 @@ class PlaylistRepositoryTest {
         }
     }
 
-    private class FakePlaylistDao(initialPlaylists: List<PlaylistEntity>) : PlaylistDao {
+    private class FakePlaylistDao(initialPlaylists: List<PlaylistEntity>) : PlaylistDao() {
         private val storedPlaylists = initialPlaylists.toMutableList()
         private val summaries = MutableStateFlow<List<PlaylistSummary>>(emptyList())
         var failNextWriteWithConstraint = false
@@ -107,11 +107,23 @@ class PlaylistRepositoryTest {
 
         override suspend fun addSong(crossRef: PlaylistSongEntity): Long = 1L
 
+        override suspend fun addSongs(crossRefs: List<PlaylistSongEntity>) = Unit
+
         override suspend fun removeSong(playlistId: Long, songId: Long) = Unit
+
+        override suspend fun removeSongFromAllPlaylists(songId: Long) = Unit
+
+        override suspend fun removeSongsFromAllPlaylists(songIds: List<Long>) = Unit
 
         override fun observeSongIds(playlistId: Long): Flow<List<Long>> = MutableStateFlow(emptyList())
 
         override suspend fun getSongIds(playlistId: Long): List<Long> = emptyList()
+
+        override suspend fun getAllSongIds(): List<Long> = emptyList()
+
+        override suspend fun getMemberships(songId: Long): List<PlaylistSongEntity> = emptyList()
+
+        override suspend fun getMemberships(songIds: List<Long>): List<PlaylistSongEntity> = emptyList()
 
         override suspend fun findPlaylistIdByName(name: String): Long? = storedPlaylists
             .firstOrNull { it.name.equals(name, ignoreCase = true) }
@@ -122,4 +134,3 @@ class PlaylistRepositoryTest {
             ?.name
     }
 }
-

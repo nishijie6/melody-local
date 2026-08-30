@@ -64,5 +64,47 @@ class PlaylistDatabaseTest {
             assertEquals(emptyList<Long>(), dao.getSongIds(playlistId))
         }
     }
-}
 
+    @Test
+    fun remapUpdatesOneOldSongIdInEveryPlaylistWithoutDuplicates() = runBlocking {
+        val first = dao.insertPlaylist(PlaylistEntity(name = "First"))
+        val second = dao.insertPlaylist(PlaylistEntity(name = "Second"))
+        dao.addSong(PlaylistSongEntity(first, 42L, addedAt = 1L))
+        dao.addSong(PlaylistSongEntity(second, 42L, addedAt = 2L))
+        dao.addSong(PlaylistSongEntity(second, 99L, addedAt = 3L))
+
+        dao.remapSongIds(mapOf(42L to 99L))
+
+        assertEquals(listOf(99L), dao.getSongIds(first))
+        assertEquals(listOf(99L), dao.getSongIds(second))
+        assertEquals(listOf(99L), dao.getAllSongIds())
+    }
+
+    @Test
+    fun metadataAndMoveJournalArePersistedAndUpdated() = runBlocking {
+        val metadata = RoomSongMetadataStore(database.songStateDao())
+        val journal = RoomMoveJournalStore(database.songStateDao())
+        metadata.put(SongMetadataOverride(7L, "Title", "Artist", "Album", "file:///cover.jpg"))
+        journal.create(
+            MoveOperationRecord("op", "Music/音澜/歌单汇总/", MoveOperationStatus.PREPARING),
+            listOf(
+                MoveItemRecord(
+                    operationId = "op",
+                    oldSongId = 7L,
+                    sourceUri = "content://media/external/audio/media/7",
+                    displayName = "song.mp3",
+                    sourceSize = 12L,
+                    status = MoveItemStatus.PREPARED,
+                )
+            ),
+        )
+
+        metadata.remap(7L, 8L)
+        val item = journal.items("op").single()
+        journal.updateItem(item.copy(status = MoveItemStatus.COPIED, newSongId = 8L))
+
+        assertEquals("Title", metadata.getAll().getValue(8L).title)
+        assertEquals(MoveItemStatus.COPIED, journal.items("op").single().status)
+        assertEquals(listOf("op"), journal.pendingOperations().map { it.id })
+    }
+}

@@ -83,6 +83,7 @@ interface LyricsStore {
     suspend fun load(songId: Long): ParsedLyrics?
     suspend fun import(songId: Long, uri: Uri): ParsedLyrics
     suspend fun delete(songId: Long)
+    suspend fun remap(oldSongId: Long, newSongId: Long)
 }
 
 class LyricsRepository(
@@ -118,6 +119,35 @@ class LyricsRepository(
         songLock(songId).withLock { lyricFile(songId).delete() }
         Unit
     }
+
+    override suspend fun remap(oldSongId: Long, newSongId: Long): Unit =
+        withContext(Dispatchers.IO) {
+            if (oldSongId == newSongId) return@withContext
+            val firstId = minOf(oldSongId, newSongId)
+            val secondId = maxOf(oldSongId, newSongId)
+            songLock(firstId).withLock {
+                songLock(secondId).withLock secondLock@{
+                    val source = lyricFile(oldSongId)
+                    if (!source.exists()) return@secondLock
+                    val destination = lyricFile(newSongId)
+                    destination.parentFile?.mkdirs()
+                    try {
+                        Files.move(
+                            source.toPath(),
+                            destination.toPath(),
+                            StandardCopyOption.ATOMIC_MOVE,
+                            StandardCopyOption.REPLACE_EXISTING,
+                        )
+                    } catch (_: AtomicMoveNotSupportedException) {
+                        Files.move(
+                            source.toPath(),
+                            destination.toPath(),
+                            StandardCopyOption.REPLACE_EXISTING,
+                        )
+                    }
+                }
+            }
+        }
 
     private fun lyricFile(songId: Long) = File(lyricsDirectory, "$songId.lrc")
 

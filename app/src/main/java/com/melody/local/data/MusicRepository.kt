@@ -24,15 +24,21 @@ fun interface MusicLibrary {
 
 class MusicRepository internal constructor(
     private val audioMediaQuery: AudioMediaQuery,
+    private val metadataStore: SongMetadataStore = EmptySongMetadataStore,
 ) : MusicLibrary {
-    constructor(context: Context) : this(
+    constructor(
+        context: Context,
+        metadataStore: SongMetadataStore = EmptySongMetadataStore,
+    ) : this(
         AudioMediaQuery { collection, projection, selection, sortOrder ->
             context.contentResolver.query(collection, projection, selection, null, sortOrder)
-        }
+        },
+        metadataStore,
     )
 
     override suspend fun loadSongs(): List<Song> = withContext(Dispatchers.IO) {
         val songs = mutableListOf<Song>()
+        val overrides = metadataStore.getAll()
         val collection = MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
         val projection = arrayOf(
             MediaStore.Audio.Media._ID,
@@ -60,9 +66,13 @@ class MusicRepository internal constructor(
             while (cursor.moveToNext()) {
                 val id = cursor.getLong(idColumn)
                 val albumId = cursor.getLong(albumIdColumn)
-                val title = cursor.getString(titleColumn).cleanMetadata("未知歌曲")
-                val artist = cursor.getString(artistColumn).cleanMetadata("未知歌手")
-                val album = cursor.getString(albumColumn).cleanMetadata("未知专辑")
+                val override = overrides[id]
+                val title = override?.title
+                    ?: cursor.getString(titleColumn).cleanMetadata("未知歌曲")
+                val artist = override?.artist
+                    ?: cursor.getString(artistColumn).cleanMetadata("未知歌手")
+                val album = override?.album
+                    ?: cursor.getString(albumColumn).cleanMetadata("未知专辑")
                 songs += Song(
                     id = id,
                     title = title,
@@ -73,9 +83,10 @@ class MusicRepository internal constructor(
                     trackNumber = cursor.getInt(trackColumn) % 1_000,
                     dateAddedSeconds = cursor.getLong(dateAddedColumn),
                     contentUri = ContentUris.withAppendedId(collection, id),
-                    albumArtUri = albumId.takeIf { it > 0 }?.let {
-                        ContentUris.withAppendedId(ALBUM_ART_URI, it)
-                    },
+                    albumArtUri = override?.artworkPath?.let(Uri::parse)
+                        ?: albumId.takeIf { it > 0 }?.let {
+                            ContentUris.withAppendedId(ALBUM_ART_URI, it)
+                        },
                 )
             }
         }

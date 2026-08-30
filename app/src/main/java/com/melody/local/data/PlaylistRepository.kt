@@ -16,6 +16,8 @@ interface PlaylistStore {
     suspend fun addSong(playlistId: Long, songId: Long): Boolean
     suspend fun removeSong(playlistId: Long, songId: Long)
     fun observeSongIds(playlistId: Long): Flow<List<Long>>
+    suspend fun getAllSongIds(): List<Long>
+    suspend fun remapSongIds(remaps: Map<Long, Long>)
 }
 
 class PlaylistRepository(private val dao: PlaylistDao) : PlaylistStore {
@@ -55,6 +57,10 @@ class PlaylistRepository(private val dao: PlaylistDao) : PlaylistStore {
         dao.removeSong(playlistId, songId)
 
     override fun observeSongIds(playlistId: Long): Flow<List<Long>> = dao.observeSongIds(playlistId)
+
+    override suspend fun getAllSongIds(): List<Long> = dao.getAllSongIds()
+
+    override suspend fun remapSongIds(remaps: Map<Long, Long>) = dao.remapSongIds(remaps)
 
     suspend fun getSongIds(playlistId: Long): List<Long> = dao.getSongIds(playlistId)
 

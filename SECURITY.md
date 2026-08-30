@@ -30,7 +30,6 @@ Do not upload private keys to issues, Actions artifacts or GitHub Releases. Losi
 
 ## Scope
 
-Useful reports include permission bypasses, unintended file disclosure, malicious LRC handling, MediaStore URI misuse, unsafe exported components, notification or MediaSession control vulnerabilities, and release-signing failures.
+Useful reports include permission bypasses, unintended file disclosure, malicious LRC handling, MediaStore URI misuse, unsafe copy/delete recovery, document-provider grant misuse, unsafe exported components, notification or MediaSession control vulnerabilities, and release-signing failures.
 
 Feature requests and ordinary playback bugs can use the public issue tracker.
-

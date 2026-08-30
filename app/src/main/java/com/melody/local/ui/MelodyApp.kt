@@ -2,9 +2,14 @@
 
 package com.melody.local.ui
 
+import android.Manifest
+import android.app.Activity
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.provider.Settings
+import androidx.activity.result.IntentSenderRequest
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -49,6 +54,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
+import androidx.compose.material.icons.automirrored.rounded.DriveFileMove
 import androidx.compose.material.icons.automirrored.rounded.PlaylistAdd
 import androidx.compose.material.icons.automirrored.rounded.QueueMusic
 import androidx.compose.material.icons.automirrored.rounded.Sort
@@ -65,6 +71,7 @@ import androidx.compose.material.icons.rounded.KeyboardArrowDown
 import androidx.compose.material.icons.rounded.LibraryMusic
 import androidx.compose.material.icons.rounded.Lyrics
 import androidx.compose.material.icons.rounded.MoreVert
+import androidx.compose.material.icons.rounded.Movie
 import androidx.compose.material.icons.rounded.MusicNote
 import androidx.compose.material.icons.rounded.Pause
 import androidx.compose.material.icons.rounded.PlayArrow
@@ -102,6 +109,7 @@ import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TextField
@@ -134,12 +142,17 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.net.toUri
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil.compose.AsyncImage
 import com.melody.local.data.PlaylistSummary
 import com.melody.local.data.Song
 import com.melody.local.data.asDuration
 import com.melody.local.lyrics.ParsedLyrics
+import com.melody.local.media.MediaOperationState
+import com.melody.local.media.PlaylistMovePreview
+import com.melody.local.media.VideoImportDraft
+import com.melody.local.media.validateDestinationFolder
 import com.melody.local.playback.PlaybackUiState
 import com.melody.local.playback.PlaybackMode
 import com.melody.local.ui.theme.Coral
@@ -182,7 +195,14 @@ fun MelodyApp(
     val sort by viewModel.sort.collectAsStateWithLifecycle()
     val isLoading by viewModel.isLoading.collectAsStateWithLifecycle()
     val libraryError by viewModel.libraryError.collectAsStateWithLifecycle()
+    val videoImportDraft by viewModel.videoImportDraft.collectAsStateWithLifecycle()
+    val videoImportState by viewModel.videoImportState.collectAsStateWithLifecycle()
+    val playlistMovePreview by viewModel.playlistMovePreview.collectAsStateWithLifecycle()
+    val playlistMoveState by viewModel.playlistMoveState.collectAsStateWithLifecycle()
+    val authorizationRequest by viewModel.authorizationRequest.collectAsStateWithLifecycle()
 
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     val snackbarHostState = remember { SnackbarHostState() }
     var selectedTab by rememberSaveable { mutableStateOf(HomeTab.SONGS) }
     var showPlayer by rememberSaveable { mutableStateOf(false) }
@@ -193,6 +213,57 @@ fun MelodyApp(
     var renameTarget by remember { mutableStateOf<PlaylistSummary?>(null) }
     var deleteTarget by remember { mutableStateOf<PlaylistSummary?>(null) }
     var showSongPicker by remember { mutableStateOf(false) }
+    var showMoveDialog by rememberSaveable { mutableStateOf(false) }
+    var pendingLegacyAction by remember { mutableStateOf<(() -> Unit)?>(null) }
+
+    val videoPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) {
+            runCatching {
+                context.contentResolver.takePersistableUriPermission(
+                    uri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION,
+                )
+            }
+            viewModel.prepareVideoImport(uri)
+        }
+    }
+    val legacyWritePermission = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        val action = pendingLegacyAction
+        pendingLegacyAction = null
+        if (granted) action?.invoke()
+        else scope.launch { snackbarHostState.showSnackbar("没有存储写入权限，无法保存或移动歌曲") }
+    }
+    val systemAuthorization = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartIntentSenderForResult()
+    ) { result ->
+        viewModel.resumePlaylistMove(result.resultCode == Activity.RESULT_OK)
+    }
+
+    fun runWithLegacyWritePermission(action: () -> Unit) {
+        val needsPermission = Build.VERSION.SDK_INT <= Build.VERSION_CODES.P &&
+            ContextCompat.checkSelfPermission(context, Manifest.permission.WRITE_EXTERNAL_STORAGE) !=
+            PackageManager.PERMISSION_GRANTED
+        if (needsPermission) {
+            pendingLegacyAction = action
+            legacyWritePermission.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+        } else {
+            action()
+        }
+    }
+
+    LaunchedEffect(authorizationRequest) {
+        val request = authorizationRequest ?: return@LaunchedEffect
+        viewModel.authorizationRequestLaunched()
+        runCatching {
+            systemAuthorization.launch(
+                IntentSenderRequest.Builder(request.pendingIntent.intentSender).build()
+            )
+        }.onFailure {
+            viewModel.resumePlaylistMove(false)
+        }
+    }
 
     LaunchedEffect(Unit) {
         viewModel.messages.collect { snackbarHostState.showSnackbar(it) }
@@ -305,6 +376,12 @@ fun MelodyApp(
                         onQueryChange = viewModel::updateQuery,
                         onSortChange = viewModel::updateSort,
                         onRefresh = viewModel::refreshSongs,
+                        onImportVideo = {
+                            viewModel.dismissVideoImportResult()
+                            runWithLegacyWritePermission {
+                                videoPicker.launch(arrayOf("video/*"))
+                            }
+                        },
                         onPlay = { index -> viewModel.playSongs(visibleSongs, index) },
                         onAddToPlaylist = { playlistPickerSong = it },
                         onOpenPlayer = { showPlayer = true },
@@ -318,6 +395,10 @@ fun MelodyApp(
                         onOpen = { openPlaylistId = it.id },
                         onRename = { renameTarget = it },
                         onDelete = { deleteTarget = it },
+                        onConsolidate = {
+                            showMoveDialog = true
+                            viewModel.loadPlaylistMovePreview()
+                        },
                     )
                 }
             }
@@ -394,6 +475,38 @@ fun MelodyApp(
             songs = allSongs.filterNot { it.id in existingIds },
             onDismiss = { showSongPicker = false },
             onSelect = { song -> viewModel.addSongToPlaylist(openPlaylistId!!, song.id) },
+        )
+    }
+
+    videoImportDraft?.let { draft ->
+        VideoImportMetadataDialog(
+            draft = draft,
+            onDismiss = viewModel::dismissVideoImportDraft,
+            onImport = viewModel::importVideoAudio,
+        )
+    }
+
+    if (videoImportState !is MediaOperationState.Idle) {
+        MediaOperationDialog(
+            title = "视频音轨导入",
+            state = videoImportState,
+            onCancel = viewModel::cancelVideoImport,
+            onDismiss = viewModel::dismissVideoImportResult,
+        )
+    }
+
+    if (showMoveDialog) {
+        PlaylistMoveDialog(
+            preview = playlistMovePreview,
+            state = playlistMoveState,
+            onStart = { folder ->
+                runWithLegacyWritePermission { viewModel.startPlaylistMove(folder) }
+            },
+            onCancel = viewModel::cancelPlaylistMove,
+            onDismiss = {
+                showMoveDialog = false
+                viewModel.dismissPlaylistMoveResult()
+            },
         )
     }
 }
@@ -484,6 +597,7 @@ private fun SongsScreen(
     onQueryChange: (String) -> Unit,
     onSortChange: (SongSort) -> Unit,
     onRefresh: () -> Unit,
+    onImportVideo: () -> Unit,
     onPlay: (Int) -> Unit,
     onAddToPlaylist: (Song) -> Unit,
     onOpenPlayer: () -> Unit,
@@ -493,7 +607,7 @@ private fun SongsScreen(
         contentPadding = PaddingValues(bottom = 24.dp),
     ) {
         item {
-            LibraryHeader(totalSongCount)
+            LibraryHeader(totalSongCount, onImportVideo)
             SearchField(query = query, onQueryChange = onQueryChange)
             SortRow(sort = sort, onSortChange = onSortChange)
         }
@@ -557,7 +671,7 @@ private fun SongsScreen(
 }
 
 @Composable
-private fun LibraryHeader(totalSongCount: Int) {
+private fun LibraryHeader(totalSongCount: Int, onImportVideo: () -> Unit) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -574,16 +688,15 @@ private fun LibraryHeader(totalSongCount: Int) {
                 style = MaterialTheme.typography.bodyMedium,
             )
         }
-        Box(
-            modifier = Modifier
-                .size(52.dp)
-                .background(
-                    Brush.linearGradient(listOf(Coral, Violet)),
-                    RoundedCornerShape(18.dp),
-                ),
-            contentAlignment = Alignment.Center,
+        FilledIconButton(
+            onClick = onImportVideo,
+            modifier = Modifier.size(52.dp),
+            colors = IconButtonDefaults.filledIconButtonColors(
+                containerColor = Coral,
+                contentColor = Ink,
+            ),
         ) {
-            Icon(Icons.Rounded.MusicNote, contentDescription = null, tint = Ink)
+            Icon(Icons.Rounded.Movie, contentDescription = "从视频提取歌曲")
         }
     }
 }
@@ -749,7 +862,9 @@ private fun PlaylistsScreen(
     onOpen: (PlaylistSummary) -> Unit,
     onRename: (PlaylistSummary) -> Unit,
     onDelete: (PlaylistSummary) -> Unit,
+    onConsolidate: () -> Unit,
 ) {
+    var headerMenuExpanded by remember { mutableStateOf(false) }
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
         contentPadding = PaddingValues(bottom = 24.dp),
@@ -767,6 +882,26 @@ private fun PlaylistsScreen(
                     Text("我的歌单", style = MaterialTheme.typography.displaySmall)
                     Spacer(Modifier.height(6.dp))
                     Text("把此刻想听的歌放在一起", color = Muted)
+                }
+                Box {
+                    IconButton(onClick = { headerMenuExpanded = true }) {
+                        Icon(Icons.Rounded.MoreVert, contentDescription = "歌单批量操作")
+                    }
+                    DropdownMenu(
+                        expanded = headerMenuExpanded,
+                        onDismissRequest = { headerMenuExpanded = false },
+                    ) {
+                        DropdownMenuItem(
+                            text = { Text("汇总歌单歌曲") },
+                            leadingIcon = {
+                                Icon(Icons.AutoMirrored.Rounded.DriveFileMove, contentDescription = null)
+                            },
+                            onClick = {
+                                headerMenuExpanded = false
+                                onConsolidate()
+                            },
+                        )
+                    }
                 }
                 FilledIconButton(
                     onClick = onCreate,
@@ -1589,6 +1724,275 @@ private fun SongPickerDialog(
         },
         confirmButton = { TextButton(onClick = onDismiss) { Text("完成") } },
     )
+}
+
+@Composable
+private fun VideoImportMetadataDialog(
+    draft: VideoImportDraft,
+    onDismiss: () -> Unit,
+    onImport: (String, String, String, Boolean) -> Unit,
+) {
+    var title by remember(draft.uri) { mutableStateOf(draft.suggestedTitle) }
+    var artist by remember(draft.uri) { mutableStateOf(draft.artist) }
+    var album by remember(draft.uri) { mutableStateOf(draft.album) }
+    var extractArtwork by remember(draft.uri) { mutableStateOf(draft.extractArtwork) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("从视频提取歌曲") },
+        text = {
+            Column(
+                modifier = Modifier.imePadding(),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                Text(
+                    "只处理你通过系统选择器授权的本地、未加密视频。输出为 M4A/AAC。",
+                    color = Muted,
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                TextField(
+                    value = title,
+                    onValueChange = { title = it },
+                    label = { Text("标题") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                TextField(
+                    value = artist,
+                    onValueChange = { artist = it },
+                    label = { Text("歌手") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                TextField(
+                    value = album,
+                    onValueChange = { album = it },
+                    label = { Text("专辑") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { extractArtwork = !extractArtwork }
+                        .padding(vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text("使用视频首帧作为唱片封面")
+                        Text("提取失败时继续使用默认封面", color = Muted, fontSize = 12.sp)
+                    }
+                    Switch(
+                        checked = extractArtwork,
+                        onCheckedChange = { extractArtwork = it },
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = { onImport(title, artist, album, extractArtwork) },
+                enabled = title.isNotBlank(),
+            ) { Text("开始提取") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
+    )
+}
+
+@Composable
+private fun MediaOperationDialog(
+    title: String,
+    state: MediaOperationState,
+    onCancel: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val active = state is MediaOperationState.Preparing ||
+        state is MediaOperationState.Processing ||
+        state is MediaOperationState.AwaitingSystemAuthorization
+    AlertDialog(
+        onDismissRequest = { if (!active) onDismiss() },
+        title = { Text(title) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                when (state) {
+                    MediaOperationState.Idle -> Unit
+                    is MediaOperationState.Preparing -> {
+                        LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                        Text(state.message, color = Muted)
+                    }
+                    is MediaOperationState.Processing -> {
+                        LinearProgressIndicator(
+                            progress = { state.progressPercent / 100f },
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                        Text(state.currentFile, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                        Text("${state.progressPercent}%", color = Muted)
+                    }
+                    is MediaOperationState.AwaitingSystemAuthorization -> {
+                        LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                        Text(state.message)
+                        Text("请在系统窗口中确认", color = Muted)
+                    }
+                    is MediaOperationState.Completed -> {
+                        Icon(Icons.Rounded.Check, contentDescription = null, tint = Coral)
+                        Text("导入完成，歌曲已经加入本地曲库。")
+                    }
+                    is MediaOperationState.Failed -> {
+                        Text("操作失败", color = MaterialTheme.colorScheme.error)
+                        Text(state.message, color = Muted)
+                    }
+                    is MediaOperationState.Cancelled -> Text("任务已取消，临时文件已清理。")
+                }
+            }
+        },
+        confirmButton = {
+            if (!active) TextButton(onClick = onDismiss) { Text("完成") }
+        },
+        dismissButton = {
+            if (active) TextButton(onClick = onCancel) { Text("取消任务") }
+        },
+    )
+}
+
+@Composable
+private fun PlaylistMoveDialog(
+    preview: PlaylistMovePreview?,
+    state: MediaOperationState,
+    onStart: (String) -> Unit,
+    onCancel: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    var folder by rememberSaveable { mutableStateOf("歌单汇总") }
+    val folderError = remember(folder) {
+        runCatching { validateDestinationFolder(folder) }.exceptionOrNull()?.message
+    }
+    val active = state is MediaOperationState.Preparing ||
+        state is MediaOperationState.Processing ||
+        state is MediaOperationState.AwaitingSystemAuthorization
+    val terminal = state is MediaOperationState.Completed ||
+        state is MediaOperationState.Failed ||
+        state is MediaOperationState.Cancelled
+    AlertDialog(
+        onDismissRequest = { if (!active) onDismiss() },
+        title = { Text("汇总所有歌单歌曲") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                when {
+                    state is MediaOperationState.Processing -> {
+                        LinearProgressIndicator(
+                            progress = { state.progressPercent / 100f },
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                        Text(state.currentFile, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                        Text(
+                            "已处理 ${state.completed} / ${state.total} · ${state.progressPercent}%",
+                            color = Muted,
+                        )
+                    }
+                    state is MediaOperationState.AwaitingSystemAuthorization -> {
+                        LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                        Text(state.message)
+                        Text(
+                            "已处理 ${state.completed} / ${state.total}。拒绝后会保留已完成部分。",
+                            color = Muted,
+                        )
+                    }
+                    state is MediaOperationState.Completed -> {
+                        val summary = state.summary
+                        Text("歌曲文件汇总完成。")
+                        Text(
+                            "已移动 ${summary.moved} 首 · 已跳过 ${summary.skipped} 首\n" +
+                                "失败 ${summary.failed} 首 · 用户取消 ${summary.cancelled} 首",
+                            color = Muted,
+                        )
+                    }
+                    state is MediaOperationState.Cancelled -> {
+                        val summary = state.summary
+                        Text("任务已取消，已成功移动的歌曲会保留。")
+                        Text(
+                            "已移动 ${summary.moved} 首 · 已跳过 ${summary.skipped} 首 · " +
+                                "失败 ${summary.failed} 首",
+                            color = Muted,
+                        )
+                    }
+                    state is MediaOperationState.Failed -> {
+                        Text("无法完成汇总", color = MaterialTheme.colorScheme.error)
+                        Text(state.message, color = Muted)
+                    }
+                    preview == null -> {
+                        LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                        Text("正在统计歌单中的唯一歌曲…", color = Muted)
+                    }
+                    else -> {
+                        Text(
+                            "去重后 ${preview.songCount} 首 · ${formatFileSize(preview.totalBytes)}",
+                            style = MaterialTheme.typography.titleMedium,
+                        )
+                        if (preview.unavailableCount > 0) {
+                            Text(
+                                "其中 ${preview.unavailableCount} 首当前不可访问，将记录为失败且不会删除原文件。",
+                                color = MaterialTheme.colorScheme.error,
+                            )
+                        }
+                        TextField(
+                            value = folder,
+                            onValueChange = { folder = it },
+                            label = { Text("目标文件夹名称") },
+                            supportingText = {
+                                Text(folderError ?: "Music/音澜/${folder.trim()}/")
+                            },
+                            isError = folderError != null,
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                        Surface(
+                            color = MaterialTheme.colorScheme.errorContainer,
+                            shape = RoundedCornerShape(14.dp),
+                        ) {
+                            Text(
+                                "这是文件移动操作：成功后原位置将不再保留。应用内原有歌单、歌词、封面和自定义信息会继续保留。开始前会停止当前播放队列。",
+                                color = MaterialTheme.colorScheme.onErrorContainer,
+                                modifier = Modifier.padding(12.dp),
+                                style = MaterialTheme.typography.bodyMedium,
+                            )
+                        }
+                        Text(
+                            if (Build.VERSION.SDK_INT == Build.VERSION_CODES.Q) {
+                                "Android 10 会按歌曲逐首显示系统授权窗口。"
+                            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                                "系统会按批次请求修改或删除媒体文件的授权。"
+                            } else {
+                                "开始时会请求旧版 Android 的存储写入权限。"
+                            },
+                            color = Muted,
+                            fontSize = 12.sp,
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            when {
+                terminal -> TextButton(onClick = onDismiss) { Text("完成") }
+                !active && preview != null -> Button(
+                    onClick = { onStart(folder) },
+                    enabled = preview.songCount > 0 && folderError == null,
+                ) { Text("确认移动") }
+            }
+        },
+        dismissButton = {
+            when {
+                active -> TextButton(onClick = onCancel) { Text("取消任务") }
+                !terminal -> TextButton(onClick = onDismiss) { Text("返回") }
+            }
+        },
+    )
+}
+
+private fun formatFileSize(bytes: Long): String = when {
+    bytes < 1_024L -> "$bytes B"
+    bytes < 1_048_576L -> "%.1f KB".format(bytes / 1_024.0)
+    bytes < 1_073_741_824L -> "%.1f MB".format(bytes / 1_048_576.0)
+    else -> "%.2f GB".format(bytes / 1_073_741_824.0)
 }
 
 @Composable

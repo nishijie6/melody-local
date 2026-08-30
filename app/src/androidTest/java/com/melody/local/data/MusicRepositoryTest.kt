@@ -48,6 +48,39 @@ class MusicRepositoryTest {
     }
 
     @Test
+    fun localMetadataAndArtworkOverrideMediaStoreValues() = runBlocking {
+        val metadata = object : SongMetadataStore {
+            override suspend fun getAll() = mapOf(
+                7L to SongMetadataOverride(
+                    7L,
+                    "Custom title",
+                    "Custom artist",
+                    "Custom album",
+                    "file:///private/cover.jpg",
+                )
+            )
+            override suspend fun put(value: SongMetadataOverride) = Unit
+            override suspend fun remap(oldSongId: Long, newSongId: Long) = Unit
+            override suspend fun delete(songId: Long) = Unit
+        }
+        val repository = MusicRepository(
+            AudioMediaQuery { _, projection, _, _ ->
+                MatrixCursor(projection).apply {
+                    addRow(arrayOf(7L, "Store title", "Store artist", "Store album", 41L, 1_000L, 1, 1L))
+                }
+            },
+            metadata,
+        )
+
+        val song = repository.loadSongs().single()
+
+        assertEquals("Custom title", song.title)
+        assertEquals("Custom artist", song.artist)
+        assertEquals("Custom album", song.album)
+        assertEquals("file:///private/cover.jpg", song.albumArtUri.toString())
+    }
+
+    @Test
     fun propagatesMediaStoreQueryFailuresToTheViewModelBoundary() {
         val repository = MusicRepository(AudioMediaQuery { _, _, _, _ ->
             throw SecurityException("permission revoked")
@@ -58,4 +91,3 @@ class MusicRepositoryTest {
         }
     }
 }
-

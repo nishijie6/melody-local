@@ -43,7 +43,7 @@ class PlaylistMigrationTest {
         }
 
         val migrated = Room.databaseBuilder(context, PlaylistDatabase::class.java, databaseName)
-            .addMigrations(PlaylistDatabase.MIGRATION_1_2)
+            .addMigrations(PlaylistDatabase.MIGRATION_1_2, PlaylistDatabase.MIGRATION_2_3)
             .allowMainThreadQueries()
             .build()
         try {
@@ -63,5 +63,53 @@ class PlaylistMigrationTest {
             context.deleteDatabase(databaseName)
         }
     }
-}
 
+    @Test
+    fun migrationFromTwoToThreePreservesPlaylistsAndCreatesOperationTables() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val databaseName = "playlist-migration-2-3-test.db"
+        context.deleteDatabase(databaseName)
+        val path = context.getDatabasePath(databaseName)
+        path.parentFile?.mkdirs()
+
+        SQLiteDatabase.openOrCreateDatabase(path, null).use { db ->
+            db.execSQL(
+                "CREATE TABLE playlists (" +
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, " +
+                    "name TEXT NOT NULL COLLATE NOCASE, createdAt INTEGER NOT NULL)"
+            )
+            db.execSQL(
+                "CREATE UNIQUE INDEX index_playlists_name_nocase ON playlists(name COLLATE NOCASE)"
+            )
+            db.execSQL(
+                "CREATE TABLE playlist_songs (" +
+                    "playlistId INTEGER NOT NULL, songId INTEGER NOT NULL, addedAt INTEGER NOT NULL, " +
+                    "PRIMARY KEY(playlistId, songId), " +
+                    "FOREIGN KEY(playlistId) REFERENCES playlists(id) ON DELETE CASCADE)"
+            )
+            db.execSQL(
+                "CREATE INDEX index_playlist_songs_playlistId_addedAt " +
+                    "ON playlist_songs(playlistId, addedAt)"
+            )
+            db.execSQL("INSERT INTO playlists(id, name, createdAt) VALUES (1, 'Focus', 1)")
+            db.execSQL("INSERT INTO playlist_songs(playlistId, songId, addedAt) VALUES (1, 55, 2)")
+            db.version = 2
+        }
+
+        val migrated = Room.databaseBuilder(context, PlaylistDatabase::class.java, databaseName)
+            .addMigrations(PlaylistDatabase.MIGRATION_2_3)
+            .allowMainThreadQueries()
+            .build()
+        try {
+            runBlocking {
+                assertEquals(listOf(55L), migrated.playlistDao().getAllSongIds())
+                val metadata = RoomSongMetadataStore(migrated.songStateDao())
+                metadata.put(SongMetadataOverride(55L, "Custom", "Artist", "Album", null))
+                assertEquals("Custom", metadata.getAll().getValue(55L).title)
+            }
+        } finally {
+            migrated.close()
+            context.deleteDatabase(databaseName)
+        }
+    }
+}
