@@ -44,3 +44,4 @@ Playlists, playback preferences and imported lyrics therefore remain on the devi
 ## Changes and questions
 
 Material privacy-model changes will be documented in this file and in [CHANGELOG.md](CHANGELOG.md). For a privacy question, open a GitHub issue that does not contain private information. Report security vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
+

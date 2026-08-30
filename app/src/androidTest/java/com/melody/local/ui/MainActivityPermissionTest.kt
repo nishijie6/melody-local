@@ -28,3 +28,4 @@ class MainActivityPermissionTest {
         composeRule.onNodeWithText("我的音乐").assertIsDisplayed()
     }
 }
+

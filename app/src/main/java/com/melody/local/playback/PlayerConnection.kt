@@ -65,6 +65,7 @@ class PlayerConnection(context: Context) :
     private var progressJob: Job? = null
     private var reconnectJob: Job? = null
     private var reconnectAttempts = 0
+    private var playbackModeCommandId = 0L
     private var released = false
     private var currentPlaybackMode: PlaybackMode = PlaybackMode.SEQUENTIAL
 
@@ -118,6 +119,9 @@ class PlayerConnection(context: Context) :
         withController { player ->
             val safeStartIndex = startIndex.coerceIn(songs.indices)
             player.setMediaItems(songs.map { it.asMediaItem() }, safeStartIndex, 0L)
+            // Reapply the service-owned policy after replacing the queue. This is especially
+            // important when an asynchronous random-order request was created for the old size.
+            sendPlaybackMode(player, currentPlaybackMode)
             player.prepare()
             player.play()
         }
@@ -164,6 +168,7 @@ class PlayerConnection(context: Context) :
 
     override fun onDisconnected(controller: MediaController) {
         if (released || this.controller !== controller) return
+        playbackModeCommandId++
         val disconnectedFuture = controllerFuture
         controller.removeListener(this)
         progressJob?.cancel()
@@ -228,6 +233,7 @@ class PlayerConnection(context: Context) :
 
     override fun release() {
         released = true
+        playbackModeCommandId++
         progressJob?.cancel()
         reconnectJob?.cancel()
         pendingActions.clear()
@@ -253,6 +259,7 @@ class PlayerConnection(context: Context) :
         duration.takeUnless { it == C.TIME_UNSET || it < 0L } ?: 0L
 
     private fun sendPlaybackMode(player: MediaController, mode: PlaybackMode) {
+        val commandId = ++playbackModeCommandId
         val requestedMode = mode
         val future = player.sendCustomCommand(
             SET_PLAYBACK_MODE_COMMAND,
@@ -264,6 +271,8 @@ class PlayerConnection(context: Context) :
                 if (
                     !released &&
                     controller === player &&
+                    commandId == playbackModeCommandId &&
+                    currentPlaybackMode == requestedMode &&
                     result?.resultCode != SessionResult.RESULT_SUCCESS
                 ) {
                     updatePlaybackMode(player.sessionExtras)

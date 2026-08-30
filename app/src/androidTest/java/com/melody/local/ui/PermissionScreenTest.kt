@@ -28,3 +28,4 @@ class PermissionScreenTest {
         assertTrue(requested)
     }
 }
+

@@ -13,3 +13,4 @@ class SongTest {
         assertEquals("1:01:01", 3_661_000L.asDuration())
     }
 }
+

@@ -69,14 +69,14 @@ import androidx.compose.material.icons.rounded.MusicNote
 import androidx.compose.material.icons.rounded.Pause
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.Refresh
-import androidx.compose.material.icons.rounded.RepeatOne
 import androidx.compose.material.icons.rounded.Repeat
+import androidx.compose.material.icons.rounded.RepeatOne
 import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.rounded.Shuffle
 import androidx.compose.material.icons.rounded.SkipNext
 import androidx.compose.material.icons.rounded.SkipPrevious
-import androidx.compose.material.icons.rounded.SwapVert
 import androidx.compose.material.icons.rounded.Stop
+import androidx.compose.material.icons.rounded.SwapVert
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -133,8 +133,8 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.core.net.toUri
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil.compose.AsyncImage
 import com.melody.local.data.PlaylistSummary
 import com.melody.local.data.Song
@@ -144,10 +144,12 @@ import com.melody.local.playback.PlaybackUiState
 import com.melody.local.playback.PlaybackMode
 import com.melody.local.ui.theme.Coral
 import com.melody.local.ui.theme.CoralSoft
+import com.melody.local.ui.theme.CardSurface
 import com.melody.local.ui.theme.Cream
 import com.melody.local.ui.theme.Ink
 import com.melody.local.ui.theme.InkSoft
 import com.melody.local.ui.theme.Muted
+import com.melody.local.ui.theme.PageBackground
 import com.melody.local.ui.theme.SurfaceRaised
 import com.melody.local.ui.theme.Violet
 import kotlinx.coroutines.launch
@@ -157,10 +159,6 @@ import kotlin.math.roundToInt
 private enum class HomeTab { SONGS, PLAYLISTS }
 
 private const val RECORD_ROTATION_DURATION_MS = 18_000
-private val NowPlayingGradientTop = Color(0xFF5A363E)
-private val NowPlayingGradientMiddle = Color(0xFF2B2631)
-private val NowPlayingGradientBottom = Color(0xFF19171F)
-private val PlayerControlSurface = Color(0xFF6C607A)
 private val ArtworkPalettes = listOf(
     listOf(Color(0xFFFF9B7E), Color(0xFF753B58)),
     listOf(Color(0xFFA793FF), Color(0xFF365477)),
@@ -227,7 +225,7 @@ fun MelodyApp(
     }
 
     Scaffold(
-        containerColor = Ink,
+        containerColor = PageBackground,
         contentWindowInsets = WindowInsets(0, 0, 0, 0),
         snackbarHost = { SnackbarHost(snackbarHostState) },
         bottomBar = {
@@ -241,7 +239,7 @@ fun MelodyApp(
                     )
                 }
                 NavigationBar(
-                    containerColor = InkSoft,
+                    containerColor = CardSurface,
                     tonalElevation = 0.dp,
                 ) {
                     NavigationBarItem(
@@ -417,7 +415,7 @@ internal fun PermissionScreen(onRequestPermission: () -> Unit) {
             .fillMaxSize()
             .background(
                 Brush.verticalGradient(
-                    listOf(Color(0xFF2A1E25), Ink, Ink)
+                    listOf(Color(0xFFFFE4DB), PageBackground, PageBackground)
                 )
             )
             .statusBarsPadding()
@@ -598,6 +596,12 @@ private fun SearchField(query: String, onQueryChange: (String) -> Unit) {
         modifier = Modifier
             .fillMaxWidth()
             .padding(horizontal = 20.dp)
+            .shadow(
+                elevation = 7.dp,
+                shape = RoundedCornerShape(18.dp),
+                ambientColor = Coral.copy(alpha = 0.10f),
+                spotColor = Coral.copy(alpha = 0.10f),
+            )
             .clip(RoundedCornerShape(18.dp)),
         placeholder = { Text("搜索歌曲、歌手或专辑") },
         leadingIcon = { Icon(Icons.Rounded.Search, contentDescription = null) },
@@ -610,8 +614,8 @@ private fun SearchField(query: String, onQueryChange: (String) -> Unit) {
         },
         singleLine = true,
         colors = TextFieldDefaults.colors(
-            focusedContainerColor = InkSoft,
-            unfocusedContainerColor = InkSoft,
+            focusedContainerColor = CardSurface,
+            unfocusedContainerColor = CardSurface,
             focusedIndicatorColor = Color.Transparent,
             unfocusedIndicatorColor = Color.Transparent,
         ),
@@ -807,10 +811,10 @@ private fun PlaylistCard(
 ) {
     var menuExpanded by remember { mutableStateOf(false) }
     val gradients = listOf(
-        listOf(Color(0xFF6B3B35), Color(0xFF2B2024)),
-        listOf(Color(0xFF433D72), Color(0xFF22202E)),
-        listOf(Color(0xFF315D58), Color(0xFF1D2929)),
-        listOf(Color(0xFF69562F), Color(0xFF2D281E)),
+        listOf(Color(0xFFFFDED5), Color(0xFFFFF6F2)),
+        listOf(Color(0xFFE5DFFF), Color(0xFFF9F7FF)),
+        listOf(Color(0xFFD9F2EC), Color(0xFFF6FCFA)),
+        listOf(Color(0xFFFFEBC9), Color(0xFFFFFAEF)),
     )
     Row(
         modifier = Modifier
@@ -825,7 +829,7 @@ private fun PlaylistCard(
         Box(
             modifier = Modifier
                 .size(66.dp)
-                .background(Color.White.copy(alpha = 0.12f), RoundedCornerShape(20.dp)),
+                .background(Color.White.copy(alpha = 0.72f), RoundedCornerShape(20.dp)),
             contentAlignment = Alignment.Center,
         ) {
             Icon(Icons.AutoMirrored.Rounded.QueueMusic, contentDescription = null, tint = Cream, modifier = Modifier.size(30.dp))
@@ -839,7 +843,7 @@ private fun PlaylistCard(
                 overflow = TextOverflow.Ellipsis,
             )
             Spacer(Modifier.height(5.dp))
-            Text("${playlist.songCount} 首歌曲", color = Cream.copy(alpha = 0.65f))
+            Text("${playlist.songCount} 首歌曲", color = Muted)
         }
         Box {
             IconButton(onClick = { menuExpanded = true }) {
@@ -864,7 +868,7 @@ private fun PlaylistCard(
                 )
             }
         }
-        Icon(Icons.Rounded.ChevronRight, contentDescription = null, tint = Cream.copy(alpha = 0.5f))
+        Icon(Icons.Rounded.ChevronRight, contentDescription = null, tint = Muted)
     }
 }
 
@@ -889,7 +893,7 @@ private fun PlaylistDetailScreen(
                     .fillMaxWidth()
                     .background(
                         Brush.verticalGradient(
-                            listOf(Color(0xFF342635), Ink)
+                            listOf(Color(0xFFFFE5DC), PageBackground)
                         )
                     )
                     .statusBarsPadding()
@@ -978,11 +982,12 @@ private fun MiniPlayer(
     onNext: () -> Unit,
 ) {
     Surface(
-        color = Color(0xFF292530),
+        color = CardSurface,
+        shape = RoundedCornerShape(20.dp),
+        shadowElevation = 8.dp,
         modifier = Modifier
             .fillMaxWidth()
             .padding(horizontal = 10.dp, vertical = 6.dp)
-            .clip(RoundedCornerShape(20.dp))
             .clickable(onClick = onClick),
     ) {
         Column {
@@ -1083,26 +1088,17 @@ private fun NowPlayingScreen(
         }
     }
 
-    Surface(
-        modifier = Modifier.fillMaxSize(),
-        color = Color.Transparent,
-        contentColor = Cream,
-    ) {
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .background(
-                    Brush.verticalGradient(
-                        listOf(
-                            NowPlayingGradientTop,
-                            NowPlayingGradientMiddle,
-                            NowPlayingGradientBottom,
-                        )
-                    )
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(
+                Brush.verticalGradient(
+                    listOf(Color(0xFFFFDDD2), Color(0xFFFFF2EC), PageBackground)
                 )
-                .statusBarsPadding()
-                .navigationBarsPadding(),
-        ) {
+            )
+            .statusBarsPadding()
+            .navigationBarsPadding(),
+    ) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -1113,7 +1109,7 @@ private fun NowPlayingScreen(
                 Icon(Icons.Rounded.KeyboardArrowDown, contentDescription = "收起播放器")
             }
             Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
-                Text("正在播放", style = MaterialTheme.typography.labelLarge, color = Cream)
+                Text("正在播放", style = MaterialTheme.typography.labelLarge, color = Muted)
                 Text(
                     playback.album.ifBlank { "本地音乐" },
                     style = MaterialTheme.typography.bodyMedium,
@@ -1127,7 +1123,7 @@ private fun NowPlayingScreen(
         Row(
             modifier = Modifier
                 .align(Alignment.CenterHorizontally)
-                .background(Color.White.copy(alpha = 0.07f), RoundedCornerShape(18.dp))
+                .background(Color.White.copy(alpha = 0.72f), RoundedCornerShape(18.dp))
                 .padding(3.dp),
         ) {
             PlayerTab(
@@ -1182,7 +1178,7 @@ private fun NowPlayingScreen(
             }
         }
 
-        Column(Modifier.padding(horizontal = 16.dp)) {
+        Column(Modifier.padding(horizontal = 24.dp)) {
             Text(
                 playback.title.ifBlank { "未知歌曲" },
                 style = MaterialTheme.typography.headlineMedium,
@@ -1209,7 +1205,7 @@ private fun NowPlayingScreen(
                 colors = SliderDefaults.colors(
                     thumbColor = Coral,
                     activeTrackColor = Coral,
-                    inactiveTrackColor = PlayerControlSurface,
+                    inactiveTrackColor = SurfaceRaised,
                 ),
             )
             Row(Modifier.fillMaxWidth()) {
@@ -1227,60 +1223,34 @@ private fun NowPlayingScreen(
                     mode = playback.playbackMode,
                     onModeChange = onPlaybackModeChange,
                 )
-                FilledIconButton(
-                    onClick = onPrevious,
-                    modifier = Modifier
-                        .size(48.dp)
-                        .border(1.dp, Cream.copy(alpha = 0.18f), CircleShape),
-                    colors = IconButtonDefaults.filledIconButtonColors(
-                        containerColor = PlayerControlSurface,
-                        contentColor = Cream,
-                    ),
-                ) {
-                    Icon(Icons.Rounded.SkipPrevious, contentDescription = "上一首", modifier = Modifier.size(32.dp))
+                IconButton(onClick = onPrevious, modifier = Modifier.size(56.dp)) {
+                    Icon(Icons.Rounded.SkipPrevious, contentDescription = "上一首", modifier = Modifier.size(38.dp))
                 }
                 FilledIconButton(
                     onClick = onTogglePlayback,
-                    modifier = Modifier.size(64.dp),
+                    modifier = Modifier.size(72.dp),
                     colors = IconButtonDefaults.filledIconButtonColors(containerColor = Coral, contentColor = Ink),
                 ) {
                     Icon(
                         if (playback.isPlaying) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,
                         contentDescription = if (playback.isPlaying) "暂停" else "播放",
-                        modifier = Modifier.size(36.dp),
+                        modifier = Modifier.size(38.dp),
                     )
                 }
-                FilledIconButton(
-                    onClick = onNext,
-                    modifier = Modifier
-                        .size(48.dp)
-                        .border(1.dp, Cream.copy(alpha = 0.18f), CircleShape),
-                    colors = IconButtonDefaults.filledIconButtonColors(
-                        containerColor = PlayerControlSurface,
-                        contentColor = Cream,
-                    ),
-                ) {
-                    Icon(Icons.Rounded.SkipNext, contentDescription = "下一首", modifier = Modifier.size(32.dp))
+                IconButton(onClick = onNext, modifier = Modifier.size(56.dp)) {
+                    Icon(Icons.Rounded.SkipNext, contentDescription = "下一首", modifier = Modifier.size(38.dp))
                 }
-                FilledIconButton(
-                    onClick = onStopPlayback,
-                    modifier = Modifier
-                        .size(48.dp)
-                        .border(1.dp, Cream.copy(alpha = 0.18f), CircleShape),
-                    colors = IconButtonDefaults.filledIconButtonColors(
-                        containerColor = PlayerControlSurface,
-                        contentColor = CoralSoft,
-                    ),
-                ) {
+                IconButton(onClick = onStopPlayback, modifier = Modifier.size(56.dp)) {
                     Icon(
                         Icons.Rounded.Stop,
                         contentDescription = "停止播放",
+                        tint = CoralSoft,
+                        modifier = Modifier.size(32.dp),
                     )
                 }
             }
             Spacer(Modifier.height(12.dp))
         }
-    }
     }
 }
 
@@ -1291,19 +1261,11 @@ private fun PlaybackModeSelector(
 ) {
     var expanded by remember { mutableStateOf(false) }
     Box {
-        FilledIconButton(
-            onClick = { expanded = true },
-            modifier = Modifier
-                .size(48.dp)
-                .border(1.dp, Cream.copy(alpha = 0.18f), CircleShape),
-            colors = IconButtonDefaults.filledIconButtonColors(
-                containerColor = PlayerControlSurface,
-                contentColor = if (mode == PlaybackMode.SEQUENTIAL) Cream else CoralSoft,
-            ),
-        ) {
+        IconButton(onClick = { expanded = true }) {
             Icon(
                 imageVector = mode.icon,
                 contentDescription = "播放模式：${mode.displayName}",
+                tint = if (mode == PlaybackMode.SEQUENTIAL) Muted else Coral,
             )
         }
         DropdownMenu(
@@ -1366,9 +1328,9 @@ private val PlaybackMode.description: String
     get() = when (this) {
         PlaybackMode.SEQUENTIAL -> "从上到下播放，列表结束后停止"
         PlaybackMode.LOOP -> "从上到下播放，列表结束后从头继续"
-        PlaybackMode.RANDOM -> "打乱当前列表的播放顺序"
+        PlaybackMode.RANDOM -> "随机遍历全部歌曲，然后开始下一轮"
         PlaybackMode.SINGLE -> "持续循环播放当前歌曲"
-        PlaybackMode.REVERSE -> "从列表末尾向前播放，到开头后从末尾继续"
+        PlaybackMode.REVERSE -> "从列表末尾向前播放，到开头后继续循环"
     }
 
 private val PlaybackMode.icon: androidx.compose.ui.graphics.vector.ImageVector
@@ -1389,13 +1351,13 @@ private fun PlayerTab(
 ) {
     Row(
         modifier = Modifier
-            .background(if (selected) Cream else Color.Transparent, RoundedCornerShape(15.dp))
+            .background(if (selected) CardSurface else Color.Transparent, RoundedCornerShape(15.dp))
             .clickable(onClick = onClick)
             .heightIn(min = 48.dp)
             .padding(horizontal = 15.dp, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Icon(icon, contentDescription = null, tint = if (selected) Ink else Muted, modifier = Modifier.size(17.dp))
+        Icon(icon, contentDescription = null, tint = if (selected) Coral else Muted, modifier = Modifier.size(17.dp))
         Spacer(Modifier.width(6.dp))
         Text(label, color = if (selected) Ink else Muted, style = MaterialTheme.typography.labelLarge)
     }
@@ -1466,7 +1428,7 @@ private fun SyncedLyrics(
                 Text(
                     text = line.text,
                     style = if (isActive) MaterialTheme.typography.headlineMedium else MaterialTheme.typography.titleLarge,
-                    color = if (isActive) Cream else Cream.copy(alpha = if (lyrics.isSynced) 0.34f else 0.78f),
+                    color = if (isActive) Ink else Muted.copy(alpha = if (lyrics.isSynced) 0.62f else 0.92f),
                     modifier = Modifier
                         .fillMaxWidth()
                         .clickable(enabled = line.timeMs != null) {
@@ -1485,7 +1447,9 @@ private fun SyncedLyrics(
         ) {
             IconButton(
                 onClick = { menuExpanded = true },
-                modifier = Modifier.background(Ink.copy(alpha = 0.55f), CircleShape),
+                modifier = Modifier
+                    .shadow(6.dp, CircleShape)
+                    .background(CardSurface, CircleShape),
             ) {
                 Icon(Icons.Rounded.MoreVert, contentDescription = "歌词菜单")
             }
@@ -1752,7 +1716,7 @@ private fun VinylRecord(
                 Box(
                     modifier = Modifier
                         .size(15.dp)
-                        .background(Cream.copy(alpha = 0.95f), CircleShape)
+                        .background(Color(0xFFFFF8F2), CircleShape)
                         .border(4.dp, Color(0xFF17151A), CircleShape),
                 )
             }

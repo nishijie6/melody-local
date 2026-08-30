@@ -2,6 +2,27 @@
 
 All notable changes to this project are documented in this file.
 
+## 1.2.0 - 2026-08-30
+
+### Added
+
+- Added an explicit stop button beside the main playback controls; stopping also clears the active queue.
+- Added restored-state binding for lyric file selection, so a picker result is always imported for the song that launched the picker.
+
+### Changed
+
+- Synchronized the stronger upstream v1.1.0 data, lyrics, playback-session, Room migration, test, CI, privacy and reproducible-build foundations.
+- Kept the local warm, light visual design instead of adopting the upstream darker presentation.
+- Moved random-order construction to `Dispatchers.Default`; reverse and all non-random mode changes remain constant-time main-thread policy updates.
+- Isolated playback-mode requests by generation and queue size so stale random results cannot overwrite a newer mode or a replaced queue.
+- Raised the application version to `1.2.0` / Android `versionCode` 4, allowing updates over both upstream code 2 and the prior local code 3 build.
+
+### Fixed
+
+- Prevented large-library random-mode switches from blocking Compose rendering, record rotation or playback controls.
+- Prevented rapid random/reverse/order switching from reverting to an older asynchronous result.
+- Reapplied the service-owned traversal policy after queue replacement without recreating, pausing, preparing or seeking the current item during a mode-only change.
+
 ## [1.1.0] - 2026-08-26
 
 ### Added

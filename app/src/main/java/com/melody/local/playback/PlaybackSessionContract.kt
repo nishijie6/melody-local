@@ -15,3 +15,4 @@ internal fun Bundle.playbackModeOrNull(): PlaybackMode? =
     getString(ARG_PLAYBACK_MODE)?.let { stored ->
         runCatching { PlaybackMode.valueOf(stored) }.getOrNull()
     }
+

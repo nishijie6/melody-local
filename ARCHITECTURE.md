@@ -37,7 +37,7 @@ Private lyrics files ◄── LyricsRepository
 
 `ui/MelodyApp.kt` contains the Compose screens for the library, playlists, mini player, full-screen player and lyrics. `MainViewModel` is the state boundary between UI and repositories. It depends on narrow `MusicLibrary`, `PlaylistStore`, `LyricsStore` and `PlaybackController` contracts, while its production constructor supplies the real implementations. It exposes `StateFlow` values for songs, filters, playlists, lyrics and playback.
 
-The UI does not own the ExoPlayer instance. It sends commands through `PlayerConnection` and observes `PlaybackUiState`.
+The UI does not own the ExoPlayer instance. It sends commands through `PlayerConnection` and observes `PlaybackUiState`. The visual layer deliberately uses one warm light color scheme; system status/navigation bars use dark icons to preserve contrast.
 
 ### Local music library
 
@@ -57,7 +57,7 @@ The UI does not own the ExoPlayer instance. It sends commands through `PlayerCon
 | Single | Canonical | One |
 | Reverse | `ReverseShuffleOrder` | All |
 
-The Media3 playlist always remains canonical. Mode changes update only shuffle traversal and repeat flags inside `MusicService`; the current MediaItem, position and buffer are never replaced. Random setup is O(n) and reverse setup is O(1), with one controller-to-session command per mode change.
+The Media3 playlist always remains canonical. Mode changes update only shuffle traversal and repeat flags inside `MusicService`; the current MediaItem, position and buffer are never replaced. Reverse and all non-random changes are O(1). Random setup is O(n), but its shuffle arrays are built on `Dispatchers.Default`, outside the main/UI thread. A monotonically increasing request generation and a queue-size check discard stale random results, so rapid mode changes and queue replacement cannot apply an obsolete traversal policy.
 
 ### Playlists
 

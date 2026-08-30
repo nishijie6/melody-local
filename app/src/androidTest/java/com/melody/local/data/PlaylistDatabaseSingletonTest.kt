@@ -24,3 +24,4 @@ class PlaylistDatabaseSingletonTest {
         second.playlistDao().deletePlaylist(id)
     }
 }
+

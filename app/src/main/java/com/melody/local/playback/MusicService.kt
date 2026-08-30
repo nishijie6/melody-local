@@ -9,7 +9,7 @@ import androidx.media3.common.C
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
-import androidx.media3.exoplayer.source.ShuffleOrder.DefaultShuffleOrder
+import androidx.media3.exoplayer.source.ShuffleOrder
 import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
 import androidx.media3.session.SessionCommand
@@ -17,10 +17,21 @@ import androidx.media3.session.SessionError
 import androidx.media3.session.SessionResult
 import com.google.common.util.concurrent.Futures
 import com.google.common.util.concurrent.ListenableFuture
+import com.google.common.util.concurrent.SettableFuture
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.util.concurrent.atomic.AtomicLong
 
 @OptIn(markerClass = [UnstableApi::class])
 class MusicService : MediaSessionService() {
     private var mediaSession: MediaSession? = null
+    private val modeScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private val playbackModeRequestId = AtomicLong()
     private val preferences by lazy {
         getSharedPreferences(PLAYBACK_PREFERENCES, Context.MODE_PRIVATE)
     }
@@ -54,8 +65,7 @@ class MusicService : MediaSessionService() {
                 ?: return Futures.immediateFuture(
                     SessionResult(SessionError.ERROR_BAD_VALUE)
                 )
-            applyPlaybackMode(session.player as ExoPlayer, requestedMode)
-            return Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
+            return applyPlaybackMode(session.player as ExoPlayer, requestedMode)
         }
     }
 
@@ -83,6 +93,8 @@ class MusicService : MediaSessionService() {
     ): MediaSession? = mediaSession
 
     override fun onDestroy() {
+        playbackModeRequestId.incrementAndGet()
+        modeScope.cancel()
         mediaSession?.run {
             player.release()
             release()
@@ -91,25 +103,64 @@ class MusicService : MediaSessionService() {
         super.onDestroy()
     }
 
-    private fun applyPlaybackMode(player: ExoPlayer, mode: PlaybackMode) {
-        when (mode) {
-            PlaybackMode.RANDOM -> {
-                player.setShuffleOrder(DefaultShuffleOrder(player.mediaItemCount))
-                player.shuffleModeEnabled = true
+    private fun applyPlaybackMode(
+        player: ExoPlayer,
+        mode: PlaybackMode,
+    ): ListenableFuture<SessionResult> {
+        val requestId = playbackModeRequestId.incrementAndGet()
+        if (mode != PlaybackMode.RANDOM) {
+            val shuffleOrder = if (mode == PlaybackMode.REVERSE) {
+                ReverseShuffleOrder(player.mediaItemCount)
+            } else {
+                null
             }
-            PlaybackMode.REVERSE -> {
-                player.setShuffleOrder(ReverseShuffleOrder(player.mediaItemCount))
-                player.shuffleModeEnabled = true
-            }
-            PlaybackMode.SEQUENTIAL, PlaybackMode.LOOP, PlaybackMode.SINGLE -> {
-                player.shuffleModeEnabled = false
+            applyPlaybackSettings(player, mode, shuffleOrder)
+            commitPlaybackMode(mode)
+            return Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
+        }
+
+        val itemCount = player.mediaItemCount
+        val result = SettableFuture.create<SessionResult>()
+        modeScope.launch {
+            try {
+                // DefaultShuffleOrder builds two O(n) arrays. Generate them off the UI thread
+                // so switching a large local library does not freeze controls or vinyl motion.
+                val shuffleOrder = withContext(Dispatchers.Default) {
+                    ShuffleOrder.DefaultShuffleOrder(itemCount)
+                }
+                if (requestId != playbackModeRequestId.get() || player.mediaItemCount != itemCount) {
+                    result.set(SessionResult(SessionError.INFO_CANCELLED))
+                    return@launch
+                }
+                applyPlaybackSettings(player, mode, shuffleOrder)
+                commitPlaybackMode(mode)
+                result.set(SessionResult(SessionResult.RESULT_SUCCESS))
+            } catch (error: CancellationException) {
+                result.cancel(false)
+                throw error
+            } catch (_: Exception) {
+                result.set(SessionResult(SessionError.ERROR_UNKNOWN))
             }
         }
+        return result
+    }
+
+    private fun applyPlaybackSettings(
+        player: ExoPlayer,
+        mode: PlaybackMode,
+        shuffleOrder: ShuffleOrder?,
+    ) {
+        // Never replace, prepare, pause or seek the active playlist while changing mode.
+        shuffleOrder?.let(player::setShuffleOrder)
+        player.shuffleModeEnabled = mode == PlaybackMode.RANDOM || mode == PlaybackMode.REVERSE
         player.repeatMode = when (repeatForMode(mode)) {
             QueueRepeat.ALL -> Player.REPEAT_MODE_ALL
             QueueRepeat.ONE -> Player.REPEAT_MODE_ONE
             QueueRepeat.NONE -> Player.REPEAT_MODE_OFF
         }
+    }
+
+    private fun commitPlaybackMode(mode: PlaybackMode) {
         playbackMode = mode
         preferences.edit { putString(ARG_PLAYBACK_MODE, mode.name) }
         mediaSession?.setSessionExtras(playbackModeBundle(mode))

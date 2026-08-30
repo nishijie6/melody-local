@@ -71,3 +71,4 @@ Never commit:
 Describe the user-visible outcome, list verification commands and mention any behavior that still requires a real device. Small, logically complete commits are easier to review and bisect.
 
 Security reports do not belong in public issues. Follow [SECURITY.md](SECURITY.md).
+
