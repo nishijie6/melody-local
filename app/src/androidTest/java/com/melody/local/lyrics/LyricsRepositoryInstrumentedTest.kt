@@ -43,6 +43,53 @@ class LyricsRepositoryInstrumentedTest {
     }
 
     @Test
+    fun savesAndReadsEditedLyricsAtomically() = runBlocking {
+        val songId = 9_008L
+        repository.delete(songId)
+        val edited = "[00:01.20]原文\n[00:01.20]Translation"
+
+        val parsed = repository.save(songId, edited)
+
+        assertEquals(listOf("原文", "Translation"), parsed.lines.map { it.text })
+        assertEquals(edited, repository.readRaw(songId))
+        assertEquals(parsed, repository.load(songId))
+        repository.delete(songId)
+    }
+
+    @Test
+    fun automaticAdoptionNeverOverwritesAnExistingLyric() = runBlocking {
+        val songId = 9_009L
+        repository.delete(songId)
+        repository.save(songId, "[00:01.00]manual")
+        val automaticSource = File(context.cacheDir, "automatic-lyrics.lrc").apply {
+            writeText("[00:01.00]automatic")
+        }
+
+        assertNull(repository.saveIfAbsent(songId, "[00:01.00]downloaded"))
+        assertNull(repository.importIfAbsent(songId, Uri.fromFile(automaticSource)))
+        assertEquals("[00:01.00]manual", repository.readRaw(songId))
+
+        automaticSource.delete()
+        repository.delete(songId)
+    }
+
+    @Test
+    fun automaticDiscoverySuppressionSurvivesSongIdRemapping() = runBlocking {
+        val oldId = 9_010L
+        val newId = 9_011L
+        repository.setAutomaticDiscoverySuppressed(oldId, false)
+        repository.setAutomaticDiscoverySuppressed(newId, false)
+        repository.setAutomaticDiscoverySuppressed(oldId, true)
+        assertNull(repository.saveIfAbsent(oldId, "[00:01.00]must not return"))
+
+        repository.remap(oldId, newId)
+
+        assertFalse(repository.isAutomaticDiscoverySuppressed(oldId))
+        assertEquals(true, repository.isAutomaticDiscoverySuppressed(newId))
+        repository.setAutomaticDiscoverySuppressed(newId, false)
+    }
+
+    @Test
     fun rejectsAFileWithoutDisplayableLyrics() {
         val source = File(context.cacheDir, "empty-lyrics.lrc").apply {
             writeText("[ar:Artist]\n[ti:Title]")
@@ -127,4 +174,3 @@ class LyricsRepositoryInstrumentedTest {
         Unit
     }
 }
-

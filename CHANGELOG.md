@@ -2,6 +2,35 @@
 
 All notable changes to this project are documented in this file.
 
+## 1.4.0 - 2026-09-04
+
+### Added
+
+- Added local-first lyric discovery: MediaStore-indexed LRC files beside the song, direct children of user-authorized document trees, and common ID3v2, FLAC Vorbis Comment and MP4/M4A embedded lyric tags.
+- Added manual LRCLIB search with ranked synchronized/plain-text results, plus an optional high-confidence automatic lookup after local sources fail.
+- Added enhanced-LRC word timing and combined original, translation and romanization layers with synchronized scrolling, seeking and word-level karaoke highlighting.
+- Added an in-app LRC and timeline editor with current-position timestamp insertion, whole-timeline millisecond shifting, validation and atomic save.
+- Added an optional draggable foreground floating lyric with Android overlay consent and persisted position.
+- Added synchronized notification and lock-screen lyrics. Pre-Android 13 notifications use the custom Media3 provider; Android 13+ System UI uses supported `displayTitle`/`subtitle` session metadata while preserving canonical song fields.
+- Added public audio-route detection for speaker, wired, classic Bluetooth, Bluetooth LE, USB and HDMI, conservative per-route lyric-delay estimates, and a separately persisted `-5000…5000 ms` manual correction for each route.
+- Added automated coverage for local/online matching, LRCLIB throttling and rate limits, embedded tags, enhanced/multilingual LRC, editing, system-line selection, output-route classification and lyric settings.
+
+### Changed
+
+- Raised the application version to `1.4.0` / Android `versionCode` 6.
+- Adopted lyrics from every source are normalized through the same bounded parser and stored as a private per-song LRC copy; automatic discovery never replaces an existing copy.
+- Lyrics now use the same route-adjusted position in the app, floating overlay, notification and lock-screen surfaces.
+- Automatic local/embedded/opted-in online discovery now runs from the playback service, shares per-song synchronization with the UI, and refreshes an open lyric panel through a content revision without duplicate requests.
+- Explicitly removing lyrics now suppresses automatic rediscovery for that song until the user manually matches, imports, edits or selects a new result.
+- Output classification now follows the selected media route: Android 13+ uses attribute-aware routed devices, while older releases combine the selected live-audio route with connected-device detail.
+
+### Privacy
+
+- Added Android's `INTERNET` permission exclusively for LRCLIB lyric search/download. Automatic online lookup is off by default; manual search or explicit opt-in is required before a request is sent.
+- LRCLIB receives search keywords or current title and available artist/album metadata, followed by a selected record ID. Local audio and existing lyrics are never uploaded.
+- Additional lyric folders require explicit Android document-tree access and only their direct children are scanned. Floating lyrics remain disabled until the user enables them and grants Android overlay access.
+- Bluetooth timing is a conservative estimate based on public output-route categories, not a measurement of codec or device latency; per-route manual calibration remains available.
+
 ## 1.3.0 - 2026-08-31
 
 ### Added

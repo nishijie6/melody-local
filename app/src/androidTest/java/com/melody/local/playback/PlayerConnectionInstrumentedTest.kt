@@ -2,6 +2,7 @@ package com.melody.local.playback
 
 import android.content.Context
 import android.net.Uri
+import android.os.Build
 import android.os.SystemClock
 import android.content.ComponentName
 import androidx.annotation.OptIn
@@ -12,8 +13,12 @@ import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.melody.local.data.Song
+import com.melody.local.lyrics.LyricsRepository
+import com.melody.local.systemlyrics.SystemLyricsSettings
+import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -126,6 +131,66 @@ class PlayerConnectionInstrumentedTest {
         assertTrue(connection.state.value.positionMs <= connection.state.value.durationMs)
     }
 
+    @Test
+    fun systemLyricMetadataIsVersionAwareAndRestoresPreviousQueueItems() = runBlocking {
+        val repository = LyricsRepository(context)
+        val firstId = 81L
+        val secondId = 82L
+        repository.delete(firstId)
+        repository.delete(secondId)
+        repository.save(firstId, "[00:00.00]First lyric")
+        repository.save(secondId, "[00:00.00]Second lyric")
+        SystemLyricsSettings(context).notificationLyricsEnabled = true
+        val songs = listOf(
+            song(firstId, "First title", "Artist 1", "Album 1", Uri.parse("content://art/81")),
+            song(secondId, "Second title", "Artist 2", "Album 2", Uri.parse("content://art/82")),
+        )
+        val future = MediaController.Builder(
+            context,
+            SessionToken(context, ComponentName(context, MusicService::class.java)),
+        ).buildAsync()
+        val observer = future.get(10, TimeUnit.SECONDS)
+        try {
+            onMain { connection.playQueue(songs, 0) }
+            waitUntil { connection.state.value.mediaId == firstId }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                waitUntil {
+                    readController(observer) {
+                        currentMediaItem?.mediaMetadata?.displayTitle?.toString()
+                    } == "First lyric"
+                }
+            } else {
+                SystemClock.sleep(300L)
+                assertNotEquals(
+                    "First lyric",
+                    readController(observer) {
+                        currentMediaItem?.mediaMetadata?.displayTitle?.toString()
+                    },
+                )
+            }
+
+            onMain { connection.seekToNext() }
+            waitUntil { connection.state.value.mediaId == secondId }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                waitUntil {
+                    readController(observer) {
+                        currentMediaItem?.mediaMetadata?.displayTitle?.toString()
+                    } == "Second lyric"
+                }
+                assertNotEquals(
+                    "First lyric",
+                    readController(observer) {
+                        getMediaItemAt(0).mediaMetadata.displayTitle?.toString()
+                    },
+                )
+            }
+        } finally {
+            onMain { MediaController.releaseFuture(future) }
+            repository.delete(firstId)
+            repository.delete(secondId)
+        }
+    }
+
     private fun testSongs(): List<Song> = listOf(
         song(1L, "First", "Artist 1", "Album 1", Uri.parse("content://art/1")),
         song(2L, "Second", "Artist 2", "Album 2", Uri.parse("content://art/2")),
@@ -146,6 +211,14 @@ class PlayerConnectionInstrumentedTest {
 
     private fun onMain(action: () -> Unit) {
         InstrumentationRegistry.getInstrumentation().runOnMainSync(action)
+    }
+
+    private fun <T> readController(controller: MediaController, block: MediaController.() -> T): T {
+        val value = AtomicReference<T>()
+        InstrumentationRegistry.getInstrumentation().runOnMainSync {
+            value.set(controller.block())
+        }
+        return value.get()
     }
 
     private fun waitForServiceMode(expected: PlaybackMode) {
@@ -204,4 +277,3 @@ class PlayerConnectionInstrumentedTest {
         }
     }
 }
-

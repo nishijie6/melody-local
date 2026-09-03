@@ -96,8 +96,95 @@ class LrcParserTest {
     fun activeLineUsesTheLastDuplicateAndHandlesPositionsBeforeTheFirstTimestamp() {
         val lyrics = LrcParser.parse("[00:01.00]first\n[00:01.00]replacement\n[00:03.00]third")
 
-        assertEquals(0, lyrics.activeLineIndex(0L))
+        assertEquals(-1, lyrics.activeLineIndex(0L))
         assertEquals(1, lyrics.activeLineIndex(1_000L))
         assertEquals(1, lyrics.activeLineIndex(2_999L))
+    }
+
+    @Test
+    fun parsesEnhancedLrcWordTimestampsAndAppliesOffset() {
+        val lyrics = LrcParser.parse(
+            "[offset:100]\n[00:01.00]<00:01.00>你<00:01.40>好 <00:01.80>world"
+        )
+
+        assertTrue(lyrics.hasWordTiming)
+        assertEquals("你好 world", lyrics.lines.single().text)
+        assertEquals(listOf(1_100L, 1_500L, 1_900L), lyrics.lines.single().segments.map { it.timeMs })
+        assertEquals(listOf("你", "好 ", "world"), lyrics.lines.single().segments.map { it.text })
+    }
+
+    @Test
+    fun structuresExplicitOriginalRomanizationAndTranslationInDisplayOrder() {
+        val lyrics = LrcParser.parse(
+            """
+            [00:01.00][translation]Hello
+            [00:01.00][original]你好
+            [00:01.00]romanization: Ni hao
+            """.trimIndent()
+        )
+
+        val structured = lyrics.structuredLines.single()
+        assertTrue(lyrics.hasTranslations)
+        assertTrue(lyrics.hasRomanization)
+        assertEquals("你好", structured.original?.text)
+        assertEquals("Ni hao", structured.romanization?.text)
+        assertEquals("Hello", structured.translation?.text)
+        assertEquals(
+            listOf(
+                LyricLayerType.ORIGINAL,
+                LyricLayerType.ROMANIZATION,
+                LyricLayerType.TRANSLATION,
+            ),
+            structured.layers.map { it.type },
+        )
+    }
+
+    @Test
+    fun structuresCommonUntaggedBilingualAndTrilingualLrcWithoutChangingLegacyLines() {
+        val lyrics = LrcParser.parse(
+            """
+            [00:01.00]你好
+            [00:01.00]Hello
+            [00:03.00]ありがとう
+            [00:03.00]Arigatou
+            [00:03.00]Thank you
+            """.trimIndent()
+        )
+
+        assertEquals(5, lyrics.lines.size)
+        assertEquals(2, lyrics.structuredLines.size)
+        assertEquals("Hello", lyrics.structuredLines[0].translation?.text)
+        assertEquals("Arigatou", lyrics.structuredLines[1].romanization?.text)
+        assertEquals("Thank you", lyrics.structuredLines[1].translation?.text)
+        assertEquals(1, lyrics.activeStructuredLineIndex(3_500L))
+    }
+
+    @Test
+    fun attachesUntimedTranslationAndRomanizationLinesToPreviousTimestamp() {
+        val lyrics = LrcParser.parse(
+            """
+            [00:01.00]你好
+            Ni hao
+            Hello
+            [00:03.00]再见
+            [tr]Goodbye
+            """.trimIndent()
+        )
+
+        assertEquals(2, lyrics.structuredLines.size)
+        assertEquals("你好", lyrics.structuredLines[0].original?.text)
+        assertEquals("Ni hao", lyrics.structuredLines[0].romanization?.text)
+        assertEquals("Hello", lyrics.structuredLines[0].translation?.text)
+        assertEquals("再见", lyrics.structuredLines[1].original?.text)
+        assertEquals("Goodbye", lyrics.structuredLines[1].translation?.text)
+    }
+
+    @Test
+    fun rejectsExcessiveEnhancedWordTimestamps() {
+        val tooManyWordTimestamps = "[00:00]" + "<00:00>a".repeat(513)
+
+        assertThrows(IllegalArgumentException::class.java) {
+            LrcParser.parse(tooManyWordTimestamps)
+        }
     }
 }

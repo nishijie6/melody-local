@@ -16,8 +16,13 @@ import com.melody.local.data.PlaylistStore
 import com.melody.local.data.PlaylistSummary
 import com.melody.local.data.Song
 import com.melody.local.lyrics.LyricLine
+import com.melody.local.lyrics.LyricsAutomationPreferences
+import com.melody.local.lyrics.LyricsResolverApi
+import com.melody.local.lyrics.LyricsResolution
 import com.melody.local.lyrics.LyricsStore
 import com.melody.local.lyrics.ParsedLyrics
+import com.melody.local.lyrics.discovery.LrclibLyricsRecord
+import com.melody.local.lyrics.discovery.RankedOnlineLyrics
 import com.melody.local.media.MediaAuthorizationRequest
 import com.melody.local.media.MediaOperationState
 import com.melody.local.media.MediaOperationSummary
@@ -30,6 +35,7 @@ import com.melody.local.playback.PlaybackController
 import com.melody.local.playback.PlaybackMode
 import com.melody.local.playback.PlaybackUiState
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -38,6 +44,7 @@ import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withContext
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -148,6 +155,12 @@ class MainViewModelInstrumentedTest {
         assertTrue(states.any { it == LyricsUiState.Loading })
 
         fixture.lyrics.loaded[1L] = Result.success<ParsedLyrics?>(parsed)
+        fixture.player.mutableState.value = PlaybackUiState(
+            mediaId = 1L,
+            lyricsContentRevision = 1L,
+        )
+        waitUntil { fixture.viewModel.lyrics.value is LyricsUiState.Ready }
+
         fixture.lyrics.importResult = Result.success(parsed)
         fixture.viewModel.importLyrics(1L, Uri.parse("content://lyrics/1"))
         waitUntil { fixture.viewModel.lyrics.value is LyricsUiState.Ready }
@@ -190,6 +203,53 @@ class MainViewModelInstrumentedTest {
         waitUntil { messages.lastOrNull() == "invalid lyric" }
 
         collection.cancel()
+        fixture.clear()
+    }
+
+    @Test
+    fun switchingSongsCancelsStaleOnlineResults() = runBlocking {
+        val resolver = FakeLyricsResolver(application)
+        val fixture = Fixture(
+            music = FakeMusicLibrary { listOf(song(1), song(2)) },
+            lyricsResolver = resolver,
+        )
+        fixture.viewModel.refreshSongs()
+        waitUntil { fixture.viewModel.allSongs.value.size == 2 }
+
+        fixture.player.mutableState.value = PlaybackUiState(mediaId = 1L)
+        fixture.viewModel.searchOnlineLyrics()
+        resolver.firstSearchStarted.await()
+
+        fixture.player.mutableState.value = PlaybackUiState(mediaId = 2L)
+        waitUntil { fixture.viewModel.lyricsSearchState.value == LyricsSearchUiState.Idle }
+        fixture.viewModel.searchOnlineLyrics()
+        waitUntil {
+            (fixture.viewModel.lyricsSearchState.value as? LyricsSearchUiState.Results)?.songId == 2L
+        }
+
+        resolver.releaseFirstSearch.complete(Unit)
+        delay(100)
+        assertEquals(
+            2L,
+            (fixture.viewModel.lyricsSearchState.value as LyricsSearchUiState.Results).songId,
+        )
+        fixture.clear()
+    }
+
+    @Test
+    fun switchingSongsDoesNotReopenAStaleLyricsEditor() = runBlocking {
+        val fixture = Fixture()
+        val allowRead = CompletableDeferred<Unit>()
+        fixture.lyrics.readGate = allowRead
+        fixture.lyrics.rawText = "[00:01.00]old song"
+        fixture.player.mutableState.value = PlaybackUiState(mediaId = 1L)
+
+        fixture.viewModel.openLyricsEditor()
+        fixture.player.mutableState.value = PlaybackUiState(mediaId = 2L)
+        allowRead.complete(Unit)
+        delay(100)
+
+        assertEquals(null, fixture.viewModel.lyricsEditorDraft.value)
         fixture.clear()
     }
 
@@ -251,6 +311,7 @@ class MainViewModelInstrumentedTest {
         music: FakeMusicLibrary = FakeMusicLibrary { emptyList() },
         videoExtractor: VideoAudioExtractor? = null,
         relocation: SongRelocationCoordinator? = null,
+        lyricsResolver: LyricsResolverApi? = null,
     ) {
         val playlists = FakePlaylistStore()
         val lyrics = FakeLyricsStore()
@@ -271,6 +332,7 @@ class MainViewModelInstrumentedTest {
                     player,
                     videoExtractor,
                     relocation,
+                    lyricsResolver,
                 ) as T
             },
         )[MainViewModel::class.java]
@@ -328,12 +390,18 @@ class MainViewModelInstrumentedTest {
         var importResult: Result<ParsedLyrics> = Result.failure(IllegalStateException("not configured"))
         var deletedSongId: Long? = null
         var loadGate: CompletableDeferred<Unit>? = null
+        var readGate: CompletableDeferred<Unit>? = null
+        var rawText: String? = null
 
         override suspend fun load(songId: Long): ParsedLyrics? {
             loadGate?.await()
             return loaded[songId]?.getOrThrow()
         }
         override suspend fun import(songId: Long, uri: Uri): ParsedLyrics = importResult.getOrThrow()
+        override suspend fun readRaw(songId: Long): String? {
+            readGate?.await()
+            return rawText
+        }
         override suspend fun delete(songId: Long) {
             deletedSongId = songId
         }
@@ -357,6 +425,48 @@ class MainViewModelInstrumentedTest {
         override fun release() {
             releaseCount++
         }
+    }
+
+    private class FakeLyricsResolver(application: Application) : LyricsResolverApi {
+        override val preferences = LyricsAutomationPreferences(application)
+        val firstSearchStarted = CompletableDeferred<Unit>()
+        val releaseFirstSearch = CompletableDeferred<Unit>()
+        private var searchCalls = 0
+
+        override suspend fun resolveAutomatically(song: Song): LyricsResolution =
+            LyricsResolution.NoResults
+
+        override suspend fun resolve(song: Song, allowOnline: Boolean): LyricsResolution =
+            LyricsResolution.NoResults
+
+        override suspend fun searchOnline(song: Song, keywords: String?): LyricsResolution {
+            searchCalls++
+            if (searchCalls == 1) {
+                firstSearchStarted.complete(Unit)
+                withContext(NonCancellable) { releaseFirstSearch.await() }
+            }
+            return LyricsResolution.OnlineChoices(listOf(match(song.id)))
+        }
+
+        override suspend fun applyOnline(
+            songId: Long,
+            result: RankedOnlineLyrics,
+        ): LyricsResolution = LyricsResolution.NoResults
+
+        private fun match(songId: Long) = RankedOnlineLyrics(
+            record = LrclibLyricsRecord(
+                id = songId,
+                trackName = "Song $songId",
+                artistName = "Artist",
+                albumName = "Album",
+                durationSeconds = 60.0,
+                instrumental = false,
+                plainLyrics = "line",
+                syncedLyrics = null,
+            ),
+            score = 90,
+            canAutoImport = true,
+        )
     }
 
     private class FakeVideoAudioExtractor : VideoAudioExtractor {

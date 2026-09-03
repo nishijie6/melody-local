@@ -1,11 +1,13 @@
 package com.melody.local.playback
 
 import android.content.Context
+import android.os.Build
 import android.os.Bundle
 import androidx.annotation.OptIn
 import androidx.core.content.edit
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
+import androidx.media3.common.MediaMetadata
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
@@ -18,6 +20,10 @@ import androidx.media3.session.SessionResult
 import com.google.common.util.concurrent.Futures
 import com.google.common.util.concurrent.ListenableFuture
 import com.google.common.util.concurrent.SettableFuture
+import com.melody.local.systemlyrics.SystemLyricSnapshot
+import com.melody.local.systemlyrics.SystemLyricsCoordinator
+import com.melody.local.systemlyrics.SystemLyricsSessionContract
+import com.melody.local.systemlyrics.SystemLyricsSettings
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -30,6 +36,11 @@ import java.util.concurrent.atomic.AtomicLong
 @OptIn(markerClass = [UnstableApi::class])
 class MusicService : MediaSessionService() {
     private var mediaSession: MediaSession? = null
+    private var systemLyricsCoordinator: SystemLyricsCoordinator? = null
+    private var systemLyricSnapshot = SystemLyricSnapshot()
+    private lateinit var lyricsNotificationProvider: LyricsMediaNotificationProvider
+    private lateinit var systemLyricsSettings: SystemLyricsSettings
+    private var systemUiMetadataBackup: SystemUiMetadataBackup? = null
     private val modeScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val playbackModeRequestId = AtomicLong()
     private val preferences by lazy {
@@ -82,10 +93,24 @@ class MusicService : MediaSessionService() {
             .setAudioAttributes(audioAttributes, true)
             .setHandleAudioBecomingNoisy(true)
             .build()
+        systemLyricsSettings = SystemLyricsSettings(this)
+        lyricsNotificationProvider = LyricsMediaNotificationProvider(this, systemLyricsSettings)
+        setMediaNotificationProvider(lyricsNotificationProvider)
         mediaSession = MediaSession.Builder(this, player)
             .setCallback(sessionCallback)
             .build()
-            .also { it.setSessionExtras(playbackModeBundle(playbackMode)) }
+            .also { updateSessionExtras(it) }
+        systemLyricsCoordinator = SystemLyricsCoordinator(this, player) { snapshot ->
+            systemLyricSnapshot = snapshot
+            lyricsNotificationProvider.updateSnapshot(snapshot)
+            mediaSession?.let { session ->
+                updateSystemUiLyricMetadata(session.player, snapshot)
+                updateSessionExtras(session)
+                if (session.player.currentMediaItem != null) {
+                    onUpdateNotification(session, isPlaybackOngoing())
+                }
+            }
+        }.also { it.start() }
     }
 
     override fun onGetSession(
@@ -94,8 +119,11 @@ class MusicService : MediaSessionService() {
 
     override fun onDestroy() {
         playbackModeRequestId.incrementAndGet()
+        systemLyricsCoordinator?.close()
+        systemLyricsCoordinator = null
         modeScope.cancel()
         mediaSession?.run {
+            restoreSystemUiLyricMetadata(player)
             player.release()
             release()
         }
@@ -163,8 +191,110 @@ class MusicService : MediaSessionService() {
     private fun commitPlaybackMode(mode: PlaybackMode) {
         playbackMode = mode
         preferences.edit { putString(ARG_PLAYBACK_MODE, mode.name) }
-        mediaSession?.setSessionExtras(playbackModeBundle(mode))
+        mediaSession?.let(::updateSessionExtras)
     }
+
+    private fun updateSessionExtras(session: MediaSession) {
+        session.setSessionExtras(
+            playbackModeBundle(playbackMode).apply {
+                putString(
+                    SystemLyricsSessionContract.EXTRA_CURRENT_LINE,
+                    systemLyricSnapshot.currentLine,
+                )
+                putString(SystemLyricsSessionContract.EXTRA_NEXT_LINE, systemLyricSnapshot.nextLine)
+                putString(
+                    SystemLyricsSessionContract.EXTRA_AUDIO_OUTPUT_ROUTE,
+                    systemLyricSnapshot.outputRoute.name,
+                )
+                putLong(
+                    SystemLyricsSessionContract.EXTRA_APPLIED_DELAY_MS,
+                    systemLyricSnapshot.appliedDelayMs,
+                )
+                putLong(
+                    SystemLyricsSessionContract.EXTRA_CONTENT_REVISION,
+                    systemLyricSnapshot.contentRevision,
+                )
+            },
+        )
+    }
+
+    /**
+     * Android 13+ builds the lock-screen/System UI media card from session metadata rather than a
+     * custom notification provider. Updating displayTitle/subtitle is the supported Media3 path;
+     * title/artist/album remain untouched so in-app metadata and queue identity stay stable.
+     */
+    private fun updateSystemUiLyricMetadata(player: Player, snapshot: SystemLyricSnapshot) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+        var item = player.currentMediaItem
+        var index = player.currentMediaItemIndex
+        if (item == null || index == C.INDEX_UNSET) {
+            restoreSystemUiLyricMetadata(player)
+            return
+        }
+        if (systemUiMetadataBackup?.mediaId != null &&
+            systemUiMetadataBackup?.mediaId != item.mediaId
+        ) {
+            restoreSystemUiLyricMetadata(player)
+            item = player.currentMediaItem ?: return
+            index = player.currentMediaItemIndex
+            if (index == C.INDEX_UNSET) return
+        }
+        val metadata = item.mediaMetadata
+        val lyric = snapshot.currentLine.takeIf {
+            systemLyricsSettings.notificationLyricsEnabled &&
+                snapshot.songId?.toString() == item.mediaId &&
+                it.isNotBlank()
+        }
+        if (lyric == null) {
+            restoreSystemUiLyricMetadata(player)
+            return
+        }
+        if (systemUiMetadataBackup == null) {
+            systemUiMetadataBackup = SystemUiMetadataBackup(
+                mediaId = item.mediaId,
+                displayTitle = metadata.displayTitle,
+                subtitle = metadata.subtitle,
+            )
+        }
+        val secondary = listOfNotNull(
+            metadata.title?.toString()?.takeIf(String::isNotBlank),
+            metadata.artist?.toString()?.takeIf(String::isNotBlank),
+        ).joinToString(" · ")
+        if (
+            metadata.displayTitle?.toString() == lyric &&
+            metadata.subtitle?.toString().orEmpty() == secondary
+        ) return
+        val updatedMetadata: MediaMetadata = metadata.buildUpon()
+            .setDisplayTitle(lyric)
+            .setSubtitle(secondary)
+            .build()
+        player.replaceMediaItem(index, item.buildUpon().setMediaMetadata(updatedMetadata).build())
+    }
+
+    private fun restoreSystemUiLyricMetadata(player: Player) {
+        val backup = systemUiMetadataBackup ?: return
+        systemUiMetadataBackup = null
+        val index = (0 until player.mediaItemCount).firstOrNull { itemIndex ->
+            player.getMediaItemAt(itemIndex).mediaId == backup.mediaId
+        } ?: return
+        val item = player.getMediaItemAt(index)
+        val metadata = item.mediaMetadata
+        if (
+            metadata.displayTitle?.toString() == backup.displayTitle?.toString() &&
+            metadata.subtitle?.toString() == backup.subtitle?.toString()
+        ) return
+        val restored = metadata.buildUpon()
+            .setDisplayTitle(backup.displayTitle)
+            .setSubtitle(backup.subtitle)
+            .build()
+        player.replaceMediaItem(index, item.buildUpon().setMediaMetadata(restored).build())
+    }
+
+    private data class SystemUiMetadataBackup(
+        val mediaId: String,
+        val displayTitle: CharSequence?,
+        val subtitle: CharSequence?,
+    )
 
     private companion object {
         const val PLAYBACK_PREFERENCES = "playback_preferences"

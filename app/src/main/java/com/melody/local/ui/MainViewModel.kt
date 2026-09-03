@@ -1,10 +1,12 @@
 package com.melody.local.ui
 
 import android.app.Application
+import android.content.Intent
 import android.net.Uri
 import android.provider.OpenableColumns
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import androidx.core.net.toUri
 import com.melody.local.data.MusicRepository
 import com.melody.local.data.MusicLibrary
 import com.melody.local.data.PlaylistNameException
@@ -15,9 +17,14 @@ import com.melody.local.data.PlaylistSummary
 import com.melody.local.data.RoomMoveJournalStore
 import com.melody.local.data.RoomSongMetadataStore
 import com.melody.local.data.Song
-import com.melody.local.lyrics.LyricsRepository
 import com.melody.local.lyrics.LyricsStore
 import com.melody.local.lyrics.ParsedLyrics
+import com.melody.local.lyrics.LyricsAutomationSettings
+import com.melody.local.lyrics.AppLyricsRuntime
+import com.melody.local.lyrics.LyricsOrigin
+import com.melody.local.lyrics.LyricsResolution
+import com.melody.local.lyrics.LyricsResolverApi
+import com.melody.local.lyrics.discovery.RankedOnlineLyrics
 import com.melody.local.playback.PlayerConnection
 import com.melody.local.playback.PlaybackController
 import com.melody.local.media.MediaAuthorizationRequest
@@ -39,6 +46,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flow
@@ -48,6 +56,7 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -88,6 +97,21 @@ sealed interface LyricsUiState {
     data class Error(val message: String) : LyricsUiState
 }
 
+data class LyricsEditorDraft(
+    val songId: Long,
+    val text: String,
+)
+
+sealed interface LyricsSearchUiState {
+    data object Idle : LyricsSearchUiState
+    data object Loading : LyricsSearchUiState
+    data class Results(
+        val songId: Long,
+        val matches: List<RankedOnlineLyrics>,
+    ) : LyricsSearchUiState
+    data class Error(val message: String) : LyricsSearchUiState
+}
+
 @OptIn(ExperimentalCoroutinesApi::class)
 class MainViewModel internal constructor(
     application: Application,
@@ -97,6 +121,7 @@ class MainViewModel internal constructor(
     val player: PlaybackController,
     private val videoAudioExtractor: VideoAudioExtractor? = null,
     private val songRelocationCoordinator: SongRelocationCoordinator? = null,
+    private val lyricsResolver: LyricsResolverApi? = null,
 ) : AndroidViewModel(application) {
     private constructor(application: Application, services: ProductionServices) : this(
         application = application,
@@ -106,6 +131,7 @@ class MainViewModel internal constructor(
         player = services.player,
         videoAudioExtractor = services.videoExtractor,
         songRelocationCoordinator = services.relocation,
+        lyricsResolver = services.lyricsResolver,
     )
 
     constructor(application: Application) : this(application, ProductionServices(application))
@@ -150,14 +176,26 @@ class MainViewModel internal constructor(
 
     private val lyricRevision = MutableStateFlow(0)
     val lyrics: StateFlow<LyricsUiState> = combine(
-        playback.map { it.mediaId }.distinctUntilChanged(),
+        playback.map { it.mediaId to it.lyricsContentRevision }.distinctUntilChanged(),
         lyricRevision,
-    ) { songId, _ -> songId }
+    ) { playbackKey, _ -> playbackKey.first }
         .flatMapLatest { songId ->
             if (songId == null) flowOf(LyricsUiState.NoSong)
             else lyricFlow(songId)
         }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), LyricsUiState.NoSong)
+
+    private val _lyricsEditorDraft = MutableStateFlow<LyricsEditorDraft?>(null)
+    val lyricsEditorDraft: StateFlow<LyricsEditorDraft?> = _lyricsEditorDraft.asStateFlow()
+
+    private val _lyricsSearchState = MutableStateFlow<LyricsSearchUiState>(LyricsSearchUiState.Idle)
+    val lyricsSearchState: StateFlow<LyricsSearchUiState> = _lyricsSearchState.asStateFlow()
+
+    private val _lyricsAutomationSettings = MutableStateFlow(
+        lyricsResolver?.preferences?.get() ?: LyricsAutomationSettings()
+    )
+    val lyricsAutomationSettings: StateFlow<LyricsAutomationSettings> =
+        _lyricsAutomationSettings.asStateFlow()
 
     private val _messages = MutableSharedFlow<String>(extraBufferCapacity = 4)
     val messages = _messages.asSharedFlow()
@@ -180,8 +218,26 @@ class MainViewModel internal constructor(
 
     private var videoMonitorJob: Job? = null
     private var relocationJob: Job? = null
+    private var lyricsSearchJob: Job? = null
+    private var lyricsSearchRequestId = 0L
+    private var lyricsEditorJob: Job? = null
+    private var lyricsEditorRequestId = 0L
 
     init {
+        viewModelScope.launch {
+            playback.map { it.mediaId }.distinctUntilChanged().collect { songId ->
+                lyricsSearchRequestId++
+                lyricsSearchJob?.cancel()
+                lyricsSearchJob = null
+                _lyricsSearchState.value = LyricsSearchUiState.Idle
+                lyricsEditorRequestId++
+                lyricsEditorJob?.cancel()
+                lyricsEditorJob = null
+                if (_lyricsEditorDraft.value?.songId != songId) {
+                    _lyricsEditorDraft.value = null
+                }
+            }
+        }
         if (videoAudioExtractor != null) monitorVideoImport(showCompletionMessage = false)
         if (songRelocationCoordinator != null) {
             relocationJob = viewModelScope.launch {
@@ -421,7 +477,10 @@ class MainViewModel internal constructor(
 
     fun importLyrics(songId: Long, uri: Uri) {
         viewModelScope.launch {
-            runCatching { lyricsRepository.import(songId, uri) }
+            runCatching {
+                lyricsRepository.import(songId, uri)
+                    .also { lyricsRepository.setAutomaticDiscoverySuppressed(songId, false) }
+            }
                 .onSuccess {
                     lyricRevision.value++
                     _messages.emit("歌词已导入")
@@ -433,15 +492,222 @@ class MainViewModel internal constructor(
     fun deleteCurrentLyrics() {
         val songId = playback.value.mediaId ?: return
         viewModelScope.launch {
-            lyricsRepository.delete(songId)
-            lyricRevision.value++
-            _messages.emit("歌词已移除")
+            try {
+                // Write the marker first so the service's file observer cannot immediately
+                // re-import embedded or online lyrics after the explicit removal.
+                lyricsRepository.setAutomaticDiscoverySuppressed(songId, true)
+                lyricsRepository.delete(songId)
+                lyricRevision.value++
+                _messages.emit("歌词已移除")
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                _messages.emit(error.message ?: "歌词移除失败")
+            }
+        }
+    }
+
+    fun openLyricsEditor() {
+        val songId = playback.value.mediaId ?: return
+        lyricsEditorJob?.cancel()
+        val requestId = ++lyricsEditorRequestId
+        lyricsEditorJob = viewModelScope.launch {
+            try {
+                val text = lyricsRepository.readRaw(songId).orEmpty()
+                if (requestId == lyricsEditorRequestId && playback.value.mediaId == songId) {
+                    _lyricsEditorDraft.value = LyricsEditorDraft(songId, text)
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                if (requestId == lyricsEditorRequestId) {
+                    _messages.emit(error.message ?: "无法打开歌词编辑器")
+                }
+            } finally {
+                if (requestId == lyricsEditorRequestId) lyricsEditorJob = null
+            }
+        }
+    }
+
+    fun dismissLyricsEditor() {
+        lyricsEditorRequestId++
+        lyricsEditorJob?.cancel()
+        lyricsEditorJob = null
+        _lyricsEditorDraft.value = null
+    }
+
+    fun saveEditedLyrics(songId: Long, text: String) {
+        viewModelScope.launch {
+            try {
+                lyricsRepository.save(songId, text)
+                lyricsRepository.setAutomaticDiscoverySuppressed(songId, false)
+                if (_lyricsEditorDraft.value?.songId == songId) {
+                    _lyricsEditorDraft.value = null
+                }
+                lyricRevision.value++
+                _messages.emit("歌词和时间轴已保存")
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                _messages.emit(error.message ?: "歌词保存失败")
+            }
+        }
+    }
+
+    fun findCurrentLyrics() {
+        val resolver = lyricsResolver ?: return
+        val song = currentSong() ?: return
+        launchLyricsSearch(song.id, announce = true, fallbackMessage = "歌词匹配失败") {
+            lyricsRepository.setAutomaticDiscoverySuppressed(song.id, false)
+            resolver.resolve(song, allowOnline = true)
+        }
+    }
+
+    fun searchOnlineLyrics(keywords: String? = null) {
+        val resolver = lyricsResolver ?: return
+        val song = currentSong() ?: return
+        launchLyricsSearch(song.id, announce = false, fallbackMessage = "在线歌词搜索失败") {
+            resolver.searchOnline(song, keywords)
+        }
+    }
+
+    fun applyOnlineLyrics(match: RankedOnlineLyrics) {
+        val resolver = lyricsResolver ?: return
+        val songId = (lyricsSearchState.value as? LyricsSearchUiState.Results)?.songId
+            ?: playback.value.mediaId
+            ?: return
+        if (playback.value.mediaId != songId) {
+            dismissLyricsSearch()
+            return
+        }
+        launchLyricsSearch(songId, announce = true, fallbackMessage = "在线歌词下载失败") {
+            resolver.applyOnline(songId, match)
+        }
+    }
+
+    fun dismissLyricsSearch() {
+        lyricsSearchRequestId++
+        lyricsSearchJob?.cancel()
+        lyricsSearchJob = null
+        _lyricsSearchState.value = LyricsSearchUiState.Idle
+    }
+
+    fun addLyricsFolder(uri: Uri) {
+        val preferences = lyricsResolver?.preferences ?: return
+        _lyricsAutomationSettings.value = preferences.addFolder(uri)
+        lyricRevision.value++
+        _messages.tryEmit("歌词目录已授权，将优先匹配同名 LRC")
+    }
+
+    fun clearLyricsFolders() {
+        val preferences = lyricsResolver?.preferences ?: return
+        preferences.get().folderUris.forEach { value ->
+            runCatching {
+                getApplication<Application>().contentResolver.releasePersistableUriPermission(
+                    value.toUri(),
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION,
+                )
+            }
+        }
+        _lyricsAutomationSettings.value = preferences.clearFolders()
+        lyricRevision.value++
+        _messages.tryEmit("已清除歌词目录授权记录")
+    }
+
+    fun setSearchAuthorizedLyricsFolders(enabled: Boolean) {
+        updateLyricsAutomation { it.copy(searchAuthorizedFolders = enabled) }
+    }
+
+    fun setReadEmbeddedLyrics(enabled: Boolean) {
+        updateLyricsAutomation { it.copy(readEmbeddedLyrics = enabled) }
+    }
+
+    fun setAutomaticOnlineLyrics(enabled: Boolean) {
+        updateLyricsAutomation { it.copy(automaticOnlineLookup = enabled) }
+    }
+
+    private fun updateLyricsAutomation(
+        transform: (LyricsAutomationSettings) -> LyricsAutomationSettings,
+    ) {
+        val preferences = lyricsResolver?.preferences ?: return
+        _lyricsAutomationSettings.value = preferences.update(transform)
+        lyricRevision.value++
+    }
+
+    private fun launchLyricsSearch(
+        songId: Long,
+        announce: Boolean,
+        fallbackMessage: String,
+        request: suspend () -> LyricsResolution,
+    ) {
+        lyricsSearchJob?.cancel()
+        val requestId = ++lyricsSearchRequestId
+        _lyricsSearchState.value = LyricsSearchUiState.Loading
+        lyricsSearchJob = viewModelScope.launch {
+            val resolution = try {
+                request()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                LyricsResolution.Failure(error.message ?: fallbackMessage)
+            }
+            if (requestId != lyricsSearchRequestId || playback.value.mediaId != songId) return@launch
+            handleLyricsResolution(songId, resolution, announce)
+            if (requestId == lyricsSearchRequestId) lyricsSearchJob = null
+        }
+    }
+
+    private suspend fun handleLyricsResolution(
+        songId: Long,
+        resolution: LyricsResolution,
+        announce: Boolean,
+    ) {
+        when (resolution) {
+            is LyricsResolution.Applied -> {
+                lyricsRepository.setAutomaticDiscoverySuppressed(songId, false)
+                _lyricsSearchState.value = LyricsSearchUiState.Idle
+                lyricRevision.value++
+                if (announce) {
+                    _messages.emit(
+                        when (resolution.origin) {
+                            LyricsOrigin.CACHED -> "已加载歌词"
+                            LyricsOrigin.AUTHORIZED_FOLDER,
+                            LyricsOrigin.SAME_MEDIA_DIRECTORY,
+                            -> "已匹配同目录歌词"
+                            LyricsOrigin.EMBEDDED_TAG -> "已读取歌曲内嵌歌词"
+                            LyricsOrigin.ONLINE -> "在线歌词已下载"
+                        }
+                    )
+                }
+            }
+            is LyricsResolution.OnlineChoices -> {
+                _lyricsSearchState.value = LyricsSearchUiState.Results(songId, resolution.matches)
+            }
+            LyricsResolution.NoResults -> {
+                _lyricsSearchState.value = LyricsSearchUiState.Error("没有找到匹配歌词")
+            }
+            is LyricsResolution.RateLimited -> {
+                _lyricsSearchState.value = LyricsSearchUiState.Error(
+                    "歌词服务请求过快，请 ${resolution.retryAfterSeconds} 秒后再试"
+                )
+            }
+            is LyricsResolution.Failure -> {
+                _lyricsSearchState.value = LyricsSearchUiState.Error(resolution.message)
+            }
         }
     }
 
     private fun lyricFlow(songId: Long): Flow<LyricsUiState> = flow {
         emit(LyricsUiState.Loading)
-        val result = runCatching { lyricsRepository.load(songId) }
+        // Automatic discovery belongs to the playback service so it continues while the Activity
+        // is stopped. The service increments lyricsContentRevision after loading or saving a file.
+        val result = try {
+            Result.success(lyricsRepository.load(songId))
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            Result.failure(error)
+        }
         emit(
             result.fold(
                 onSuccess = { parsed ->
@@ -450,6 +716,11 @@ class MainViewModel internal constructor(
                 onFailure = { LyricsUiState.Error(it.message ?: "歌词加载失败") },
             )
         )
+    }
+
+    private fun currentSong(): Song? {
+        val songId = playback.value.mediaId ?: return null
+        return _allSongs.value.firstOrNull { it.id == songId }
     }
 
     private fun monitorVideoImport(showCompletionMessage: Boolean) {
@@ -529,8 +800,10 @@ class MainViewModel internal constructor(
 private class ProductionServices(application: Application) {
     private val database = PlaylistDatabase.getInstance(application)
     private val metadata = RoomSongMetadataStore(database.songStateDao())
+    private val lyricsRuntime = AppLyricsRuntime.get(application)
     val playlists = PlaylistRepository(database.playlistDao())
-    val lyrics = LyricsRepository(application)
+    val lyrics = lyricsRuntime.repository
+    val lyricsResolver = lyricsRuntime.resolver
     val player = PlayerConnection(application)
     val musicRepository = MusicRepository(application, metadata)
     val videoExtractor = WorkManagerVideoAudioExtractor(application)

@@ -16,6 +16,8 @@ import androidx.media3.session.SessionResult
 import androidx.media3.session.SessionToken
 import com.google.common.util.concurrent.ListenableFuture
 import com.melody.local.data.Song
+import com.melody.local.systemlyrics.AudioOutputRoute
+import com.melody.local.systemlyrics.SystemLyricsSessionContract
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -38,6 +40,9 @@ data class PlaybackUiState(
     val positionMs: Long = 0,
     val durationMs: Long = 0,
     val playbackMode: PlaybackMode = PlaybackMode.SEQUENTIAL,
+    val lyricDelayMs: Long = 0L,
+    val lyricsContentRevision: Long = 0L,
+    val audioOutputRoute: AudioOutputRoute = AudioOutputRoute.UNKNOWN,
 )
 
 interface PlaybackController {
@@ -68,6 +73,9 @@ class PlayerConnection(context: Context) :
     private var playbackModeCommandId = 0L
     private var released = false
     private var currentPlaybackMode: PlaybackMode = PlaybackMode.SEQUENTIAL
+    private var currentLyricDelayMs: Long = 0L
+    private var currentLyricsContentRevision: Long = 0L
+    private var currentAudioOutputRoute: AudioOutputRoute = AudioOutputRoute.UNKNOWN
 
     private val _state = MutableStateFlow(PlaybackUiState(playbackMode = currentPlaybackMode))
     override val state: StateFlow<PlaybackUiState> = _state.asStateFlow()
@@ -99,7 +107,7 @@ class PlayerConnection(context: Context) :
                         reconnectJob?.cancel()
                         reconnectJob = null
                         connectedController.addListener(this)
-                        updatePlaybackMode(connectedController.sessionExtras)
+                        updateSessionExtras(connectedController.sessionExtras)
                         while (pendingActions.isNotEmpty()) {
                             pendingActions.removeFirst()(connectedController)
                         }
@@ -163,7 +171,7 @@ class PlayerConnection(context: Context) :
 
     override fun onExtrasChanged(controller: MediaController, extras: Bundle) {
         if (released || this.controller !== controller) return
-        updatePlaybackMode(extras)
+        updateSessionExtras(extras)
     }
 
     override fun onDisconnected(controller: MediaController) {
@@ -201,6 +209,9 @@ class PlayerConnection(context: Context) :
             positionMs = player.currentPosition.coerceAtLeast(0L),
             durationMs = player.safeDuration(),
             playbackMode = currentPlaybackMode,
+            lyricDelayMs = currentLyricDelayMs,
+            lyricsContentRevision = currentLyricsContentRevision,
+            audioOutputRoute = currentAudioOutputRoute,
         )
         updateProgressLoop(player.isPlaying)
     }
@@ -275,17 +286,33 @@ class PlayerConnection(context: Context) :
                     currentPlaybackMode == requestedMode &&
                     result?.resultCode != SessionResult.RESULT_SUCCESS
                 ) {
-                    updatePlaybackMode(player.sessionExtras)
+                    updateSessionExtras(player.sessionExtras)
                 }
             },
             ContextCompat.getMainExecutor(appContext),
         )
     }
 
-    private fun updatePlaybackMode(extras: Bundle) {
-        val mode = extras.playbackModeOrNull() ?: return
-        currentPlaybackMode = mode
-        _state.value = _state.value.copy(playbackMode = mode)
+    private fun updateSessionExtras(extras: Bundle) {
+        extras.playbackModeOrNull()?.let { currentPlaybackMode = it }
+        currentLyricDelayMs = extras.getLong(
+            SystemLyricsSessionContract.EXTRA_APPLIED_DELAY_MS,
+            currentLyricDelayMs,
+        )
+        currentLyricsContentRevision = extras.getLong(
+            SystemLyricsSessionContract.EXTRA_CONTENT_REVISION,
+            currentLyricsContentRevision,
+        )
+        currentAudioOutputRoute = extras.getString(
+            SystemLyricsSessionContract.EXTRA_AUDIO_OUTPUT_ROUTE,
+        )?.let { stored -> runCatching { AudioOutputRoute.valueOf(stored) }.getOrNull() }
+            ?: currentAudioOutputRoute
+        _state.value = _state.value.copy(
+            playbackMode = currentPlaybackMode,
+            lyricDelayMs = currentLyricDelayMs,
+            lyricsContentRevision = currentLyricsContentRevision,
+            audioOutputRoute = currentAudioOutputRoute,
+        )
     }
 
     private fun Song.asMediaItem(): MediaItem {

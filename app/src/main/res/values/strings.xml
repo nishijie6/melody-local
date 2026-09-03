@@ -1,3 +1,12 @@
 <resources>
     <string name="app_name">音澜</string>
+    <string name="floating_lyrics_title">音澜 · 桌面歌词</string>
+    <string name="close_floating_lyrics">关闭桌面歌词</string>
+    <string name="floating_lyrics_waiting_for_playback">等待播放歌曲</string>
+    <string name="floating_lyrics_missing">当前歌曲还没有歌词</string>
+    <string name="floating_lyrics_no_next_line">暂无下一句</string>
+    <string name="floating_lyrics_notification_title">桌面歌词正在显示</string>
+    <string name="floating_lyrics_notification_text">点击返回音澜</string>
+    <string name="floating_lyrics_channel_name">桌面歌词</string>
+    <string name="floating_lyrics_channel_description">保持用户开启的桌面悬浮歌词可见</string>
 </resources>

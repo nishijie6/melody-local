@@ -79,6 +79,8 @@ import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Repeat
 import androidx.compose.material.icons.rounded.RepeatOne
 import androidx.compose.material.icons.rounded.Search
+import androidx.compose.material.icons.rounded.Settings
+import androidx.compose.material.icons.rounded.CloudDownload
 import androidx.compose.material.icons.rounded.Shuffle
 import androidx.compose.material.icons.rounded.SkipNext
 import androidx.compose.material.icons.rounded.SkipPrevious
@@ -137,6 +139,10 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -149,12 +155,16 @@ import com.melody.local.data.PlaylistSummary
 import com.melody.local.data.Song
 import com.melody.local.data.asDuration
 import com.melody.local.lyrics.ParsedLyrics
+import com.melody.local.lyrics.LyricLayerType
+import com.melody.local.lyrics.StructuredLyricLayer
 import com.melody.local.media.MediaOperationState
 import com.melody.local.media.PlaylistMovePreview
 import com.melody.local.media.VideoImportDraft
 import com.melody.local.media.validateDestinationFolder
 import com.melody.local.playback.PlaybackUiState
 import com.melody.local.playback.PlaybackMode
+import com.melody.local.systemlyrics.FloatingLyricsController
+import com.melody.local.systemlyrics.SystemLyricsSettings
 import com.melody.local.ui.theme.Coral
 import com.melody.local.ui.theme.CoralSoft
 import com.melody.local.ui.theme.CardSurface
@@ -191,6 +201,9 @@ fun MelodyApp(
     val playlistSongs by viewModel.selectedPlaylistSongs.collectAsStateWithLifecycle()
     val playback by viewModel.playback.collectAsStateWithLifecycle()
     val lyrics by viewModel.lyrics.collectAsStateWithLifecycle()
+    val lyricsEditorDraft by viewModel.lyricsEditorDraft.collectAsStateWithLifecycle()
+    val lyricsSearchState by viewModel.lyricsSearchState.collectAsStateWithLifecycle()
+    val lyricsAutomationSettings by viewModel.lyricsAutomationSettings.collectAsStateWithLifecycle()
     val query by viewModel.query.collectAsStateWithLifecycle()
     val sort by viewModel.sort.collectAsStateWithLifecycle()
     val isLoading by viewModel.isLoading.collectAsStateWithLifecycle()
@@ -203,6 +216,7 @@ fun MelodyApp(
 
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
+    val systemLyricsSettings = remember { SystemLyricsSettings(context) }
     val snackbarHostState = remember { SnackbarHostState() }
     var selectedTab by rememberSaveable { mutableStateOf(HomeTab.SONGS) }
     var showPlayer by rememberSaveable { mutableStateOf(false) }
@@ -214,6 +228,8 @@ fun MelodyApp(
     var deleteTarget by remember { mutableStateOf<PlaylistSummary?>(null) }
     var showSongPicker by remember { mutableStateOf(false) }
     var showMoveDialog by rememberSaveable { mutableStateOf(false) }
+    var showLyricsSettings by rememberSaveable { mutableStateOf(false) }
+    var systemLyricsSettingsRevision by remember { mutableFloatStateOf(0f) }
     var pendingLegacyAction by remember { mutableStateOf<(() -> Unit)?>(null) }
 
     val videoPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
@@ -225,6 +241,41 @@ fun MelodyApp(
                 )
             }
             viewModel.prepareVideoImport(uri)
+        }
+    }
+    val lyricsFolderPicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocumentTree()
+    ) { uri ->
+        if (uri != null) {
+            runCatching {
+                context.contentResolver.takePersistableUriPermission(
+                    uri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION,
+                )
+            }
+            viewModel.addLyricsFolder(uri)
+        }
+    }
+    val overlayPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) {
+        val granted = FloatingLyricsController.canDrawOverlays(context)
+        if (granted) FloatingLyricsController.setEnabled(context, true)
+        systemLyricsSettingsRevision += 1f
+        scope.launch {
+            snackbarHostState.showSnackbar(
+                if (granted) "桌面悬浮歌词已开启" else "未授予悬浮窗权限"
+            )
+        }
+    }
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        systemLyricsSettingsRevision += 1f
+        scope.launch {
+            snackbarHostState.showSnackbar(
+                if (granted) "通知与锁屏歌词已启用" else "未授予通知权限"
+            )
         }
     }
     val legacyWritePermission = rememberLauncherForActivityResult(
@@ -291,7 +342,93 @@ fun MelodyApp(
             onPlaybackModeChange = viewModel.player::setPlaybackMode,
             onImportLyrics = viewModel::importLyrics,
             onDeleteLyrics = viewModel::deleteCurrentLyrics,
+            onEditLyrics = viewModel::openLyricsEditor,
+            onFindLyrics = viewModel::findCurrentLyrics,
+            onSearchOnlineLyrics = viewModel::searchOnlineLyrics,
+            onOpenLyricsSettings = { showLyricsSettings = true },
         )
+        lyricsEditorDraft?.let { draft ->
+            LyricsEditorDialog(
+                initialText = draft.text,
+                playbackPositionMs = (playback.positionMs - playback.lyricDelayMs).coerceAtLeast(0L),
+                onDismiss = viewModel::dismissLyricsEditor,
+                onSave = { text -> viewModel.saveEditedLyrics(draft.songId, text) },
+            )
+        }
+        if (lyricsSearchState !is LyricsSearchUiState.Idle) {
+            LyricsSearchDialog(
+                state = lyricsSearchState,
+                onSearch = viewModel::searchOnlineLyrics,
+                onSelect = viewModel::applyOnlineLyrics,
+                onDismiss = viewModel::dismissLyricsSearch,
+            )
+        }
+        if (showLyricsSettings) {
+            val overlayGranted = FloatingLyricsController.canDrawOverlays(context)
+            val notificationGranted = Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+                ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) ==
+                PackageManager.PERMISSION_GRANTED
+            val route = playback.audioOutputRoute
+            val overlayEnabled = remember(systemLyricsSettingsRevision) {
+                systemLyricsSettings.overlayEnabled
+            }
+            val notificationEnabled = remember(systemLyricsSettingsRevision) {
+                systemLyricsSettings.notificationLyricsEnabled
+            }
+            val automaticLatencyEnabled = remember(systemLyricsSettingsRevision) {
+                systemLyricsSettings.automaticLatencyCompensationEnabled
+            }
+            val manualDelay = remember(systemLyricsSettingsRevision, route) {
+                systemLyricsSettings.manualDelayMs(route)
+            }
+            val appliedDelay = remember(systemLyricsSettingsRevision, route) {
+                systemLyricsSettings.appliedDelayMs(route)
+            }
+            LyricsSettingsDialog(
+                automation = lyricsAutomationSettings,
+                outputRoute = route,
+                overlayPermissionGranted = overlayGranted,
+                notificationPermissionGranted = notificationGranted,
+                overlayEnabled = overlayEnabled,
+                notificationLyricsEnabled = notificationEnabled,
+                automaticLatencyEnabled = automaticLatencyEnabled,
+                manualDelayMs = manualDelay,
+                appliedDelayMs = appliedDelay,
+                onSelectFolder = { lyricsFolderPicker.launch(null) },
+                onClearFolders = viewModel::clearLyricsFolders,
+                onSearchFoldersChange = viewModel::setSearchAuthorizedLyricsFolders,
+                onEmbeddedChange = viewModel::setReadEmbeddedLyrics,
+                onAutomaticOnlineChange = viewModel::setAutomaticOnlineLyrics,
+                onOverlayChange = { enabled ->
+                    if (enabled && !FloatingLyricsController.canDrawOverlays(context)) {
+                        overlayPermissionLauncher.launch(
+                            FloatingLyricsController.permissionIntent(context)
+                        )
+                    } else {
+                        FloatingLyricsController.setEnabled(context, enabled)
+                        systemLyricsSettingsRevision += 1f
+                    }
+                },
+                onNotificationChange = { enabled ->
+                    systemLyricsSettings.notificationLyricsEnabled = enabled
+                    // A false value already implies API 33+: older releases do not require the
+                    // runtime notification permission.
+                    if (enabled && !notificationGranted) {
+                        notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                    }
+                    systemLyricsSettingsRevision += 1f
+                },
+                onAutomaticLatencyChange = { enabled ->
+                    systemLyricsSettings.automaticLatencyCompensationEnabled = enabled
+                    systemLyricsSettingsRevision += 1f
+                },
+                onManualDelayChange = { delay ->
+                    systemLyricsSettings.setManualDelayMs(route, delay)
+                    systemLyricsSettingsRevision += 1f
+                },
+                onDismiss = { showLyricsSettings = false },
+            )
+        }
         return
     }
 
@@ -1185,6 +1322,10 @@ private fun NowPlayingScreen(
     onPlaybackModeChange: (PlaybackMode) -> Unit,
     onImportLyrics: (Long, Uri) -> Unit,
     onDeleteLyrics: () -> Unit,
+    onEditLyrics: () -> Unit,
+    onFindLyrics: () -> Unit,
+    onSearchOnlineLyrics: (String?) -> Unit,
+    onOpenLyricsSettings: () -> Unit,
 ) {
     var showLyrics by rememberSaveable { mutableStateOf(false) }
     val pendingLyricsSongId = rememberPendingLyricsSongId()
@@ -1285,13 +1426,17 @@ private fun NowPlayingScreen(
             if (lyricsVisible) {
                 LyricsPanel(
                     lyricsState = lyricsState,
-                    positionMs = playback.positionMs,
+                    positionMs = (playback.positionMs - playback.lyricDelayMs).coerceAtLeast(0L),
                     onSeek = onSeek,
                     onImport = {
                         pendingLyricsSongId.value = playback.mediaId
                         importLauncher.launch(arrayOf("text/plain", "application/octet-stream"))
                     },
                     onDelete = onDeleteLyrics,
+                    onEdit = onEditLyrics,
+                    onFind = onFindLyrics,
+                    onSearchOnline = { onSearchOnlineLyrics(null) },
+                    onOpenSettings = onOpenLyricsSettings,
                 )
             } else {
                 Box(
@@ -1505,75 +1650,34 @@ private fun LyricsPanel(
     onSeek: (Long) -> Unit,
     onImport: () -> Unit,
     onDelete: () -> Unit,
+    onEdit: () -> Unit,
+    onFind: () -> Unit,
+    onSearchOnline: () -> Unit,
+    onOpenSettings: () -> Unit,
 ) {
-    when (lyricsState) {
-        LyricsUiState.NoSong, LyricsUiState.Loading -> LoadingState("正在加载歌词…")
-        LyricsUiState.Missing -> MessageState(
-            icon = Icons.Rounded.Lyrics,
-            title = "还没有歌词",
-            message = "导入与歌曲对应的 LRC 文件，即可随播放进度高亮滚动",
-            actionLabel = "导入 LRC",
-            onAction = onImport,
-        )
-        is LyricsUiState.Error -> MessageState(
-            icon = Icons.Rounded.Lyrics,
-            title = "歌词无法显示",
-            message = lyricsState.message,
-            actionLabel = "重新导入",
-            onAction = onImport,
-        )
-        is LyricsUiState.Ready -> SyncedLyrics(
-            lyrics = lyricsState.lyrics,
-            positionMs = positionMs,
-            onSeek = onSeek,
-            onImport = onImport,
-            onDelete = onDelete,
-        )
-    }
-}
-
-@Composable
-private fun SyncedLyrics(
-    lyrics: ParsedLyrics,
-    positionMs: Long,
-    onSeek: (Long) -> Unit,
-    onImport: () -> Unit,
-    onDelete: () -> Unit,
-) {
-    val listState = rememberLazyListState()
-    val scope = rememberCoroutineScope()
-    val activeIndex = lyrics.activeLineIndex(positionMs)
     var menuExpanded by remember { mutableStateOf(false) }
-
-    LaunchedEffect(activeIndex) {
-        if (activeIndex >= 0 && lyrics.isSynced) {
-            listState.animateScrollToItem((activeIndex - 2).coerceAtLeast(0))
-        }
-    }
-
     Box(Modifier.fillMaxSize()) {
-        LazyColumn(
-            state = listState,
-            modifier = Modifier.fillMaxSize(),
-            contentPadding = PaddingValues(horizontal = 28.dp, vertical = 30.dp),
-            verticalArrangement = Arrangement.spacedBy(20.dp),
-        ) {
-            itemsIndexed(lyrics.lines) { index, line ->
-                val isActive = index == activeIndex
-                Text(
-                    text = line.text,
-                    style = if (isActive) MaterialTheme.typography.headlineMedium else MaterialTheme.typography.titleLarge,
-                    color = if (isActive) Ink else Muted.copy(alpha = if (lyrics.isSynced) 0.62f else 0.92f),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clickable(enabled = line.timeMs != null) {
-                            line.timeMs?.let(onSeek)
-                            scope.launch { listState.animateScrollToItem((index - 2).coerceAtLeast(0)) }
-                        }
-                        .padding(vertical = 2.dp),
-                )
-            }
-            item { Spacer(Modifier.height(80.dp)) }
+        when (lyricsState) {
+            LyricsUiState.NoSong, LyricsUiState.Loading -> LoadingState("正在加载歌词…")
+            LyricsUiState.Missing -> MessageState(
+                icon = Icons.Rounded.Lyrics,
+                title = "还没有歌词",
+                message = "可自动匹配同目录/内嵌歌词、在线搜索，或手动导入 LRC",
+                actionLabel = "自动匹配",
+                onAction = onFind,
+            )
+            is LyricsUiState.Error -> MessageState(
+                icon = Icons.Rounded.Lyrics,
+                title = "歌词无法显示",
+                message = lyricsState.message,
+                actionLabel = "自动匹配",
+                onAction = onFind,
+            )
+            is LyricsUiState.Ready -> SyncedLyrics(
+                lyrics = lyricsState.lyrics,
+                positionMs = positionMs,
+                onSeek = onSeek,
+            )
         }
         Box(
             modifier = Modifier
@@ -1590,21 +1694,121 @@ private fun SyncedLyrics(
             }
             DropdownMenu(expanded = menuExpanded, onDismissRequest = { menuExpanded = false }) {
                 DropdownMenuItem(
-                    text = { Text("更换歌词") },
-                    leadingIcon = { Icon(Icons.Rounded.FolderOpen, contentDescription = null) },
-                    onClick = {
-                        menuExpanded = false
-                        onImport()
-                    },
+                    text = { Text("自动匹配歌词") },
+                    leadingIcon = { Icon(Icons.Rounded.Search, contentDescription = null) },
+                    onClick = { menuExpanded = false; onFind() },
                 )
                 DropdownMenuItem(
-                    text = { Text("移除歌词") },
-                    leadingIcon = { Icon(Icons.Rounded.Delete, contentDescription = null) },
-                    onClick = {
-                        menuExpanded = false
-                        onDelete()
-                    },
+                    text = { Text("在线搜索歌词") },
+                    leadingIcon = { Icon(Icons.Rounded.CloudDownload, contentDescription = null) },
+                    onClick = { menuExpanded = false; onSearchOnline() },
                 )
+                DropdownMenuItem(
+                    text = { Text("编辑歌词和时间轴") },
+                    leadingIcon = { Icon(Icons.Rounded.Edit, contentDescription = null) },
+                    onClick = { menuExpanded = false; onEdit() },
+                )
+                DropdownMenuItem(
+                    text = { Text("导入/更换本地歌词") },
+                    leadingIcon = { Icon(Icons.Rounded.FolderOpen, contentDescription = null) },
+                    onClick = { menuExpanded = false; onImport() },
+                )
+                DropdownMenuItem(
+                    text = { Text("歌词设置") },
+                    leadingIcon = { Icon(Icons.Rounded.Settings, contentDescription = null) },
+                    onClick = { menuExpanded = false; onOpenSettings() },
+                )
+                if (lyricsState is LyricsUiState.Ready) {
+                    DropdownMenuItem(
+                        text = { Text("移除歌词") },
+                        leadingIcon = { Icon(Icons.Rounded.Delete, contentDescription = null) },
+                        onClick = { menuExpanded = false; onDelete() },
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SyncedLyrics(
+    lyrics: ParsedLyrics,
+    positionMs: Long,
+    onSeek: (Long) -> Unit,
+) {
+    val listState = rememberLazyListState()
+    val scope = rememberCoroutineScope()
+    val activeIndex = lyrics.activeStructuredLineIndex(positionMs)
+
+    LaunchedEffect(activeIndex) {
+        if (activeIndex >= 0 && lyrics.isSynced) {
+            listState.animateScrollToItem((activeIndex - 2).coerceAtLeast(0))
+        }
+    }
+
+    Box(Modifier.fillMaxSize()) {
+        LazyColumn(
+            state = listState,
+            modifier = Modifier.fillMaxSize(),
+            contentPadding = PaddingValues(horizontal = 28.dp, vertical = 30.dp),
+            verticalArrangement = Arrangement.spacedBy(20.dp),
+        ) {
+            itemsIndexed(lyrics.structuredLines) { index, line ->
+                val isActive = index == activeIndex
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable(enabled = line.timeMs != null) {
+                            line.timeMs?.let(onSeek)
+                            scope.launch { listState.animateScrollToItem((index - 2).coerceAtLeast(0)) }
+                        }
+                        .padding(vertical = 2.dp),
+                    verticalArrangement = Arrangement.spacedBy(5.dp),
+                ) {
+                    line.layers.forEach { layer ->
+                        val primary = layer.type == LyricLayerType.ORIGINAL
+                        Text(
+                            text = highlightedLayerText(
+                                layer = layer,
+                                positionMs = positionMs,
+                                active = isActive,
+                            ),
+                            style = when {
+                                primary && isActive -> MaterialTheme.typography.headlineMedium
+                                primary -> MaterialTheme.typography.titleLarge
+                                else -> MaterialTheme.typography.bodyLarge
+                            },
+                            color = when {
+                                isActive && layer.segments.isNotEmpty() -> Color.Unspecified
+                                isActive && primary -> Ink
+                                isActive -> InkSoft
+                                else -> Muted.copy(alpha = if (lyrics.isSynced) 0.66f else 0.92f)
+                            },
+                        )
+                    }
+                }
+            }
+            item { Spacer(Modifier.height(80.dp)) }
+        }
+    }
+}
+
+private fun highlightedLayerText(
+    layer: StructuredLyricLayer,
+    positionMs: Long,
+    active: Boolean,
+): AnnotatedString {
+    if (!active || layer.segments.isEmpty()) return AnnotatedString(layer.text)
+    return buildAnnotatedString {
+        layer.segments.forEach { segment ->
+            val reached = positionMs >= segment.timeMs
+            withStyle(
+                SpanStyle(
+                    color = if (reached) Ink else Muted.copy(alpha = 0.55f),
+                    fontWeight = if (reached) FontWeight.SemiBold else FontWeight.Normal,
+                )
+            ) {
+                append(segment.text)
             }
         }
     }

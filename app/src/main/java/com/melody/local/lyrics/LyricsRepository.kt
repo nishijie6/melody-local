@@ -82,6 +82,15 @@ internal fun replaceFileAtomically(
 interface LyricsStore {
     suspend fun load(songId: Long): ParsedLyrics?
     suspend fun import(songId: Long, uri: Uri): ParsedLyrics
+    suspend fun importIfAbsent(songId: Long, uri: Uri): ParsedLyrics? =
+        if (load(songId) == null) import(songId, uri) else null
+    suspend fun readRaw(songId: Long): String? = null
+    suspend fun save(songId: Long, text: String): ParsedLyrics =
+        throw UnsupportedOperationException("歌词存储不支持编辑")
+    suspend fun saveIfAbsent(songId: Long, text: String): ParsedLyrics? =
+        if (load(songId) == null) save(songId, text) else null
+    suspend fun isAutomaticDiscoverySuppressed(songId: Long): Boolean = false
+    suspend fun setAutomaticDiscoverySuppressed(songId: Long, suppressed: Boolean) = Unit
     suspend fun delete(songId: Long)
     suspend fun remap(oldSongId: Long, newSongId: Long)
 }
@@ -105,18 +114,65 @@ class LyricsRepository(
 
     override suspend fun import(songId: Long, uri: Uri): ParsedLyrics = withContext(Dispatchers.IO) {
         songLock(songId).withLock {
-            val bytes = requireNotNull(inputStreamOpener(uri)) {
-                "无法读取所选歌词文件"
-            }.use { it.readBytesWithLimit(MAX_LYRIC_SIZE_BYTES) }
-            val parsed = LrcParser.parse(LrcParser.decode(bytes))
-            require(parsed.lines.isNotEmpty()) { "歌词文件中没有可显示的内容" }
-            replaceFileAtomically(lyricFile(songId), bytes)
-            parsed
+            importLocked(songId, uri)
         }
     }
 
+    override suspend fun importIfAbsent(songId: Long, uri: Uri): ParsedLyrics? =
+        withContext(Dispatchers.IO) {
+            songLock(songId).withLock {
+                if (lyricFile(songId).exists() || suppressionFile(songId).exists()) {
+                    return@withLock null
+                }
+                importLocked(songId, uri)
+            }
+        }
+
+    override suspend fun readRaw(songId: Long): String? = withContext(Dispatchers.IO) {
+        songLock(songId).withLock {
+            lyricFile(songId).takeIf(File::exists)?.readBytes()?.let(LrcParser::decode)
+        }
+    }
+
+    override suspend fun save(songId: Long, text: String): ParsedLyrics = withContext(Dispatchers.IO) {
+        songLock(songId).withLock {
+            saveLocked(songId, text)
+        }
+    }
+
+    override suspend fun saveIfAbsent(songId: Long, text: String): ParsedLyrics? =
+        withContext(Dispatchers.IO) {
+            songLock(songId).withLock {
+                if (lyricFile(songId).exists() || suppressionFile(songId).exists()) {
+                    return@withLock null
+                }
+                saveLocked(songId, text)
+            }
+        }
+
     override suspend fun delete(songId: Long): Unit = withContext(Dispatchers.IO) {
         songLock(songId).withLock { lyricFile(songId).delete() }
+        Unit
+    }
+
+    override suspend fun isAutomaticDiscoverySuppressed(songId: Long): Boolean =
+        withContext(Dispatchers.IO) {
+            songLock(songId).withLock { suppressionFile(songId).exists() }
+        }
+
+    override suspend fun setAutomaticDiscoverySuppressed(
+        songId: Long,
+        suppressed: Boolean,
+    ): Unit = withContext(Dispatchers.IO) {
+        songLock(songId).withLock {
+            val marker = suppressionFile(songId)
+            if (suppressed) {
+                marker.parentFile?.mkdirs()
+                if (!marker.exists()) marker.createNewFile()
+            } else {
+                marker.delete()
+            }
+        }
         Unit
     }
 
@@ -127,29 +183,55 @@ class LyricsRepository(
             val secondId = maxOf(oldSongId, newSongId)
             songLock(firstId).withLock {
                 songLock(secondId).withLock secondLock@{
-                    val source = lyricFile(oldSongId)
-                    if (!source.exists()) return@secondLock
-                    val destination = lyricFile(newSongId)
-                    destination.parentFile?.mkdirs()
-                    try {
-                        Files.move(
-                            source.toPath(),
-                            destination.toPath(),
-                            StandardCopyOption.ATOMIC_MOVE,
-                            StandardCopyOption.REPLACE_EXISTING,
-                        )
-                    } catch (_: AtomicMoveNotSupportedException) {
-                        Files.move(
-                            source.toPath(),
-                            destination.toPath(),
-                            StandardCopyOption.REPLACE_EXISTING,
-                        )
-                    }
+                    movePrivateFileIfPresent(lyricFile(oldSongId), lyricFile(newSongId))
+                    movePrivateFileIfPresent(
+                        suppressionFile(oldSongId),
+                        suppressionFile(newSongId),
+                    )
                 }
             }
         }
 
     private fun lyricFile(songId: Long) = File(lyricsDirectory, "$songId.lrc")
+    private fun suppressionFile(songId: Long) = File(lyricsDirectory, "$songId.no-auto")
+
+    private fun movePrivateFileIfPresent(source: File, destination: File) {
+        if (!source.exists()) return
+        destination.parentFile?.mkdirs()
+        try {
+            Files.move(
+                source.toPath(),
+                destination.toPath(),
+                StandardCopyOption.ATOMIC_MOVE,
+                StandardCopyOption.REPLACE_EXISTING,
+            )
+        } catch (_: AtomicMoveNotSupportedException) {
+            Files.move(
+                source.toPath(),
+                destination.toPath(),
+                StandardCopyOption.REPLACE_EXISTING,
+            )
+        }
+    }
+
+    private fun importLocked(songId: Long, uri: Uri): ParsedLyrics {
+        val bytes = requireNotNull(inputStreamOpener(uri)) {
+            "无法读取所选歌词文件"
+        }.use { it.readBytesWithLimit(MAX_LYRIC_SIZE_BYTES) }
+        val parsed = LrcParser.parse(LrcParser.decode(bytes))
+        require(parsed.lines.isNotEmpty()) { "歌词文件中没有可显示的内容" }
+        replaceFileAtomically(lyricFile(songId), bytes)
+        return parsed
+    }
+
+    private fun saveLocked(songId: Long, text: String): ParsedLyrics {
+        val bytes = text.toByteArray(Charsets.UTF_8)
+        if (bytes.size > MAX_LYRIC_SIZE_BYTES) throw LyricFileTooLargeException()
+        val parsed = LrcParser.parse(text)
+        require(parsed.lines.isNotEmpty()) { "歌词内容中没有可显示的内容" }
+        replaceFileAtomically(lyricFile(songId), bytes)
+        return parsed
+    }
 
     private fun songLock(songId: Long): Mutex = songLocks.getOrPut(songId) { Mutex() }
 
