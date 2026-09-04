@@ -1,9 +1,15 @@
 package com.melody.local.playback
 
-import android.content.Context
-import android.net.Uri
-import android.os.SystemClock
 import android.content.ComponentName
+import android.content.Context
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
+import android.media.AudioManager
+import android.media.MediaPlayer
+import android.net.Uri
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
 import androidx.annotation.OptIn
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.session.MediaController
@@ -124,6 +130,54 @@ class PlayerConnectionInstrumentedTest {
             state.durationMs > 0L && state.positionMs <= state.durationMs
         }
         assertTrue(connection.state.value.positionMs <= connection.state.value.durationMs)
+    }
+
+    @Test
+    fun resumesAfterCompetingPlaybackReleasesPermanentAudioFocus() {
+        val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        val competingFocusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+            .setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                    .build()
+            )
+            .setOnAudioFocusChangeListener({}, Handler(Looper.getMainLooper()))
+            .build()
+        val competingPlayer = MediaPlayer().apply {
+            setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                    .build()
+            )
+            setDataSource(audioFile.absolutePath)
+            isLooping = true
+            prepare()
+        }
+
+        try {
+            onMain { connection.playQueue(testSongs().take(1), startIndex = 0) }
+            waitUntil { connection.state.value.isPlaying }
+
+            assertEquals(
+                AudioManager.AUDIOFOCUS_REQUEST_GRANTED,
+                audioManager.requestAudioFocus(competingFocusRequest),
+            )
+            competingPlayer.start()
+            waitUntil { !connection.state.value.isPlaying }
+            val interruptedPositionMs = connection.state.value.positionMs
+
+            competingPlayer.stop()
+            audioManager.abandonAudioFocusRequest(competingFocusRequest)
+
+            waitUntil(timeoutMs = 5_000L) { connection.state.value.isPlaying }
+            assertEquals(1L, connection.state.value.mediaId)
+            assertTrue(connection.state.value.positionMs >= interruptedPositionMs)
+        } finally {
+            runCatching { competingPlayer.release() }
+            audioManager.abandonAudioFocusRequest(competingFocusRequest)
+        }
     }
 
     private fun testSongs(): List<Song> = listOf(
