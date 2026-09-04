@@ -63,6 +63,7 @@ enum class MoveOperationStatus {
     PREPARING,
     MOVING,
     AWAITING_PERMISSION,
+    CANCELLING,
     COMMITTING,
     COMPLETED,
     CANCELLED,
@@ -72,6 +73,7 @@ enum class MoveOperationStatus {
 enum class MoveItemStatus {
     PREPARED,
     COPIED,
+    CANCELLING,
     SOURCE_DELETED,
     COMMITTED,
     SKIPPED,
@@ -133,6 +135,7 @@ class RoomMoveJournalStore(
         dao.updateMoveItem(
             operationId = item.operationId,
             oldSongId = item.oldSongId,
+            sourceUri = item.sourceUri,
             status = item.status.name,
             newSongId = item.newSongId,
             destinationUri = item.destinationUri,

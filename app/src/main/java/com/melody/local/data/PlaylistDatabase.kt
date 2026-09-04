@@ -209,7 +209,8 @@ abstract class SongStateDao {
 
     @Query(
         "SELECT * FROM move_operations " +
-            "WHERE status IN ('PREPARING', 'MOVING', 'AWAITING_PERMISSION', 'COMMITTING') " +
+            "WHERE status IN " +
+                "('PREPARING', 'MOVING', 'AWAITING_PERMISSION', 'CANCELLING', 'COMMITTING') " +
             "ORDER BY createdAt ASC"
     )
     abstract suspend fun getPendingMoveOperations(): List<MoveOperationEntity>
@@ -228,7 +229,7 @@ abstract class SongStateDao {
 
     @Query(
         """
-        UPDATE move_items SET status = :status, newSongId = :newSongId,
+        UPDATE move_items SET sourceUri = :sourceUri, status = :status, newSongId = :newSongId,
             destinationUri = :destinationUri, checksum = :checksum, error = :error
         WHERE operationId = :operationId AND oldSongId = :oldSongId
         """
@@ -236,6 +237,7 @@ abstract class SongStateDao {
     abstract suspend fun updateMoveItem(
         operationId: String,
         oldSongId: Long,
+        sourceUri: String,
         status: String,
         newSongId: Long?,
         destinationUri: String?,

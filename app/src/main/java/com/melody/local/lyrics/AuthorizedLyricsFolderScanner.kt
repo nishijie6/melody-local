@@ -20,15 +20,19 @@ data class AuthorizedLyricDocument(
     val folderUri: Uri,
 )
 
+fun interface AuthorizedLyricsCandidateScanner {
+    suspend fun listCandidates(folderUris: Collection<Uri>): List<AuthorizedLyricDocument>
+}
+
 /**
  * Scans only directories the user explicitly selected with ACTION_OPEN_DOCUMENT_TREE.
  * This keeps automatic sidecar matching compatible with scoped storage without broad
  * storage-management permissions.
  */
-class AuthorizedLyricsFolderScanner(context: Context) {
+class AuthorizedLyricsFolderScanner(context: Context) : AuthorizedLyricsCandidateScanner {
     private val resolver: ContentResolver = context.applicationContext.contentResolver
 
-    suspend fun listCandidates(folderUris: Collection<Uri>): List<AuthorizedLyricDocument> =
+    override suspend fun listCandidates(folderUris: Collection<Uri>): List<AuthorizedLyricDocument> =
         withContext(Dispatchers.IO) {
             buildList {
                 for (treeUri in folderUris.distinct()) {
@@ -103,11 +107,16 @@ class AuthorizedLyricsFolderScanner(context: Context) {
 }
 
 class AuthorizedFolderLyricsSource(
-    private val scanner: AuthorizedLyricsFolderScanner,
-    private val preferences: LyricsAutomationPreferences,
+    private val scanner: AuthorizedLyricsCandidateScanner,
+    private val settingsProvider: () -> LyricsAutomationSettings,
 ) : LocalLyricsSource {
+    constructor(
+        scanner: AuthorizedLyricsCandidateScanner,
+        preferences: LyricsAutomationPreferences,
+    ) : this(scanner, preferences::get)
+
     override suspend fun find(track: LyricsTrack): LocalLyricsLookup {
-        val settings = preferences.get()
+        val settings = settingsProvider()
         if (!settings.searchAuthorizedFolders) {
             return LocalLyricsLookup.Unavailable("已关闭授权目录自动匹配")
         }

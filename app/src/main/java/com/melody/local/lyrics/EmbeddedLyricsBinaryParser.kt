@@ -56,7 +56,10 @@ object EmbeddedLyricsBinaryParser {
         if (tagSize !in 1..MAX_METADATA_BYTES) return null
         var tag = input.readExactly(tagSize) ?: return null
         val tagFlags = header[5].toInt() and 0xff
-        if ((tagFlags and 0x80) != 0) tag = removeUnsynchronization(tag)
+        val tagUnsynchronized = (tagFlags and 0x80) != 0
+        // ID3v2.4 defines unsynchronisation per frame. Removing bytes from the complete tag would
+        // invalidate the frame sizes before they can be walked safely.
+        if (tagUnsynchronized && version < 4) tag = removeUnsynchronization(tag)
 
         var position = id3FrameStart(tag, version, tagFlags) ?: return null
         var preferred: EmbeddedLyrics? = null
@@ -79,13 +82,17 @@ object EmbeddedLyricsBinaryParser {
                 position + frameHeaderSize + frameSize > tag.size
             ) break
             val flags = if (version >= 3) unsignedInt16(tag, position + 8) else 0
-            var payload = tag.copyOfRange(
+            val storedPayload = tag.copyOfRange(
                 position + frameHeaderSize,
                 position + frameHeaderSize + frameSize,
             )
             position += frameHeaderSize + frameSize
-            if (version >= 3 && hasUnsupportedId3FrameTransform(version, flags)) continue
-            if (version == 4 && (flags and 0x0002) != 0) payload = removeUnsynchronization(payload)
+            val payload = prepareId3FramePayload(
+                version = version,
+                flags = flags,
+                storedPayload = storedPayload,
+                tagUnsynchronized = tagUnsynchronized,
+            ) ?: continue
 
             val parsed = when (frameId) {
                 "USLT", "ULT" -> parseUslt(payload)
@@ -109,10 +116,51 @@ object EmbeddedLyricsBinaryParser {
         }
     }
 
-    private fun hasUnsupportedId3FrameTransform(version: Int, flags: Int): Boolean = when (version) {
-        3 -> (flags and 0x00c0) != 0 // compression or encryption
-        4 -> (flags and 0x000c) != 0 // compression or encryption
-        else -> false
+    private fun prepareId3FramePayload(
+        version: Int,
+        flags: Int,
+        storedPayload: ByteArray,
+        tagUnsynchronized: Boolean,
+    ): ByteArray? {
+        return when (version) {
+            2 -> storedPayload
+            3 -> {
+                if ((flags and 0x00c0) != 0) return null // compression or encryption
+                val dataStart = if ((flags and 0x0020) != 0) 1 else 0 // grouping identity
+                if (dataStart > storedPayload.size) {
+                    null
+                } else {
+                    storedPayload.copyOfRange(dataStart, storedPayload.size)
+                }
+            }
+            4 -> {
+                // Status flags 0x70 and format flags 0x4f are the only defined v2.4 bits.
+                if ((flags and 0x8fb0) != 0) return null
+                if ((flags and 0x000c) != 0) return null // compression or encryption
+
+                var position = 0
+                if ((flags and 0x0040) != 0) { // grouping identity byte
+                    if (position >= storedPayload.size) return null
+                    position++
+                }
+                val declaredDataLength = if ((flags and 0x0001) != 0) {
+                    if (position + 4 > storedPayload.size ||
+                        storedPayload.sliceArray(position until position + 4)
+                            .any { (it.toInt() and 0x80) != 0 }
+                    ) return null
+                    syncSafeInt(storedPayload, position).also { position += 4 }
+                } else {
+                    null
+                }
+                var data = storedPayload.copyOfRange(position, storedPayload.size)
+                if (tagUnsynchronized || (flags and 0x0002) != 0) {
+                    data = removeUnsynchronization(data)
+                }
+                if (declaredDataLength != null && declaredDataLength != data.size) return null
+                data
+            }
+            else -> null
+        }
     }
 
     private fun parseUslt(payload: ByteArray): EmbeddedLyrics? {
@@ -141,18 +189,72 @@ object EmbeddedLyricsBinaryParser {
         val description = decodeEncoded(payload, 6, descriptorEnd, encoding).trim().ifBlank { null }
         var position = descriptorEnd + terminatorWidth(encoding)
         val output = StringBuilder()
+        val line = mutableListOf<SyltSegment>()
+        var lineLength = 0
         var entryCount = 0
+
+        fun flushLine(): Boolean {
+            if (line.isEmpty()) return true
+            val rendered = buildString {
+                append(formatLrcTimestamp(line.first().timestampMs))
+                line.forEach { segment ->
+                    append(formatEnhancedLrcTimestamp(segment.timestampMs))
+                    append(segment.text)
+                }
+            }
+            if (output.length + rendered.length + 1 > MAX_TEXT_BYTES) return false
+            output.append(rendered).append('\n')
+            line.clear()
+            lineLength = 0
+            return true
+        }
+
+        fun appendFragment(fragment: String, timestampMs: Long): Boolean {
+            if (fragment.isEmpty()) return true
+            var fragmentStart = 0
+            while (fragmentStart < fragment.length) {
+                val fragmentEnd = minOf(
+                    fragment.length,
+                    fragmentStart + MAX_SYLT_SEGMENT_CHARACTERS,
+                )
+                val part = fragment.substring(fragmentStart, fragmentEnd)
+                val cost = formatEnhancedLrcTimestamp(timestampMs).length + part.length
+                if (
+                    line.isNotEmpty() &&
+                    (line.size >= MAX_SYLT_SEGMENTS_PER_LINE ||
+                        lineLength + cost > MAX_SYLT_LRC_LINE_CHARACTERS)
+                ) {
+                    if (!flushLine()) return false
+                }
+                line += SyltSegment(timestampMs, part)
+                lineLength += cost
+                fragmentStart = fragmentEnd
+            }
+            return true
+        }
+
         while (position < payload.size && entryCount++ < MAX_SYNCED_ENTRIES) {
             val textEnd = findEncodedTerminator(payload, position, encoding) ?: break
             val timestampStart = textEnd + terminatorWidth(encoding)
             if (timestampStart + 4 > payload.size) break
-            val lyric = decodeEncoded(payload, position, textEnd, encoding).trim()
+            val lyric = decodeEncoded(payload, position, textEnd, encoding)
+                .replace("\r\n", "\n")
+                .replace('\r', '\n')
             val timestamp = unsignedInt32(payload, timestampStart)
-            if (lyric.isNotBlank() && timestamp <= MAX_REASONABLE_TIMESTAMP_MS) {
-                output.append(formatLrcTimestamp(timestamp)).append(lyric).append('\n')
+            if (timestamp <= MAX_REASONABLE_TIMESTAMP_MS) {
+                var fragmentStart = 0
+                lyric.forEachIndexed { index, character ->
+                    if (character == '\n') {
+                        if (!appendFragment(lyric.substring(fragmentStart, index), timestamp)) return null
+                        if (!flushLine()) return null
+                        fragmentStart = index + 1
+                    }
+                }
+                if (!appendFragment(lyric.substring(fragmentStart), timestamp)) return null
             }
             position = timestampStart + 4
         }
+        if (!flushLine()) return null
         val lyrics = output.toString().trimEnd().cleanLyricText() ?: return null
         return EmbeddedLyrics(
             text = lyrics,
@@ -412,9 +514,12 @@ object EmbeddedLyricsBinaryParser {
     private fun formatLrcTimestamp(timestampMs: Long): String {
         val minutes = timestampMs / 60_000
         val seconds = timestampMs % 60_000 / 1_000
-        val hundredths = timestampMs % 1_000 / 10
-        return "[%02d:%02d.%02d]".format(Locale.ROOT, minutes, seconds, hundredths)
+        val milliseconds = timestampMs % 1_000
+        return "[%02d:%02d.%03d]".format(Locale.ROOT, minutes, seconds, milliseconds)
     }
+
+    private fun formatEnhancedLrcTimestamp(timestampMs: Long): String =
+        formatLrcTimestamp(timestampMs).replace('[', '<').replace(']', '>')
 
     private fun removeUnsynchronization(bytes: ByteArray): ByteArray {
         val output = ByteArrayOutputStream(bytes.size)
@@ -524,6 +629,7 @@ object EmbeddedLyricsBinaryParser {
 
     private data class StreamAtomHeader(val type: String, val size: Long, val headerSize: Long)
     private data class ByteArrayAtom(val start: Int, val payloadStart: Int, val end: Int, val type: String)
+    private data class SyltSegment(val timestampMs: Long, val text: String)
 
     private val ID3_MAGIC = byteArrayOf('I'.code.toByte(), 'D'.code.toByte(), '3'.code.toByte())
     private val FLAC_MAGIC = byteArrayOf('f'.code.toByte(), 'L'.code.toByte(), 'a'.code.toByte(), 'C'.code.toByte())
@@ -542,6 +648,9 @@ object EmbeddedLyricsBinaryParser {
     private const val MAX_TEXT_BYTES = 2 * 1024 * 1024
     private const val MAX_ID3_FRAMES = 10_000
     private const val MAX_SYNCED_ENTRIES = 20_000
+    private const val MAX_SYLT_SEGMENTS_PER_LINE = 256
+    private const val MAX_SYLT_SEGMENT_CHARACTERS = 1_024
+    private const val MAX_SYLT_LRC_LINE_CHARACTERS = 3_800
     private const val MAX_REASONABLE_TIMESTAMP_MS = 7L * 24 * 60 * 60 * 1_000
     private const val MAX_FLAC_BLOCKS = 256
     private const val MAX_FLAC_METADATA_SCAN_BYTES = 64L * 1024 * 1024

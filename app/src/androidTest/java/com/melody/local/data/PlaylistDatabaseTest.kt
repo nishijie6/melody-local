@@ -101,10 +101,56 @@ class PlaylistDatabaseTest {
 
         metadata.remap(7L, 8L)
         val item = journal.items("op").single()
-        journal.updateItem(item.copy(status = MoveItemStatus.COPIED, newSongId = 8L))
+        journal.updateItem(
+            item.copy(
+                sourceUri = "content://media/external_primary/audio/media/7",
+                status = MoveItemStatus.COPIED,
+                newSongId = 8L,
+            )
+        )
 
         assertEquals("Title", metadata.getAll().getValue(8L).title)
         assertEquals(MoveItemStatus.COPIED, journal.items("op").single().status)
+        assertEquals(
+            "content://media/external_primary/audio/media/7",
+            journal.items("op").single().sourceUri,
+        )
         assertEquals(listOf("op"), journal.pendingOperations().map { it.id })
+    }
+
+    @Test
+    fun cancellingOperationRemainsDiscoverableForCrashRecovery() = runBlocking {
+        val journal = RoomMoveJournalStore(database.songStateDao())
+        journal.create(
+            MoveOperationRecord(
+                id = "cancel-recovery",
+                targetRelativePath = "Music/音澜/歌单汇总/",
+                status = MoveOperationStatus.MOVING,
+            ),
+            listOf(
+                MoveItemRecord(
+                    operationId = "cancel-recovery",
+                    oldSongId = 17L,
+                    sourceUri = "content://media/external_primary/audio/media/17",
+                    displayName = "song.m4a",
+                    sourceSize = 128L,
+                    status = MoveItemStatus.SOURCE_DELETED,
+                    newSongId = 23L,
+                    destinationUri = "content://media/external_primary/audio/media/23",
+                    checksum = "abc",
+                )
+            ),
+        )
+
+        journal.updateOperation("cancel-recovery", MoveOperationStatus.CANCELLING)
+
+        assertEquals(
+            listOf("cancel-recovery"),
+            journal.pendingOperations().map { it.id },
+        )
+        assertEquals(
+            MoveItemStatus.SOURCE_DELETED,
+            journal.items("cancel-recovery").single().status,
+        )
     }
 }

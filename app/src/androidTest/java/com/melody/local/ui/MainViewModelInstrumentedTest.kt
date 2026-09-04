@@ -282,16 +282,112 @@ class MainViewModelInstrumentedTest {
     }
 
     @Test
-    fun relocationStopsPlaybackPreventsDoubleStartAndKeepsPartialResultAfterDenial() = runBlocking {
+    fun rapidVideoImportDoubleTapOnlyStartsOneEnqueue() = runBlocking {
+        val extractor = FakeVideoAudioExtractor().apply {
+            enqueueGate = CompletableDeferred()
+        }
+        val fixture = Fixture(videoExtractor = extractor)
+        val source = Uri.fromFile(application.cacheDir.resolve("double-tap-video.mp4"))
+
+        fixture.viewModel.prepareVideoImport(source)
+        waitUntil { fixture.viewModel.videoImportDraft.value != null }
+        fixture.viewModel.importVideoAudio("First", "Artist", "Album", false)
+        assertTrue(fixture.viewModel.videoImportState.value is MediaOperationState.Preparing)
+        fixture.viewModel.importVideoAudio("Second", "Artist", "Album", false)
+
+        waitUntil { extractor.enqueueCalls == 1 }
+        delay(100L)
+        assertEquals(1, extractor.enqueueCalls)
+        extractor.enqueueGate?.complete(Unit)
+        waitUntil { extractor.requests.size == 1 }
+        assertEquals("First", extractor.requests.single().title)
+        fixture.clear()
+    }
+
+    @Test
+    fun rejectedVideoEnqueueRestoresPreviousUiStateAndKeepsDraft() = runBlocking {
+        val extractor = FakeVideoAudioExtractor().apply {
+            enqueueResult = false
+            enqueueGate = CompletableDeferred()
+        }
+        val fixture = Fixture(videoExtractor = extractor)
+        val source = Uri.fromFile(application.cacheDir.resolve("rejected-video.mp4"))
+
+        fixture.viewModel.prepareVideoImport(source)
+        waitUntil { fixture.viewModel.videoImportDraft.value != null }
+        fixture.viewModel.importVideoAudio("Rejected", "Artist", "Album", true)
+        assertTrue(fixture.viewModel.videoImportState.value is MediaOperationState.Preparing)
+
+        waitUntil { extractor.enqueueCalls == 1 }
+        extractor.enqueueGate?.complete(Unit)
+        waitUntil { fixture.viewModel.videoImportState.value is MediaOperationState.Idle }
+        assertTrue(fixture.viewModel.videoImportDraft.value != null)
+        fixture.clear()
+    }
+
+    @Test
+    fun rejectedVideoEnqueueReattachesToRecoveredBackgroundWork() = runBlocking {
+        val recovered = MediaOperationState.Processing("Recovered audio", 0, 1, 35)
+        val extractor = FakeVideoAudioExtractor().apply {
+            enqueueResult = false
+            stateOnRejectedEnqueue = recovered
+            enqueueGate = CompletableDeferred()
+        }
+        val fixture = Fixture(videoExtractor = extractor)
+        val source = Uri.fromFile(application.cacheDir.resolve("recovered-video.mp4"))
+
+        fixture.viewModel.prepareVideoImport(source)
+        waitUntil { fixture.viewModel.videoImportDraft.value != null }
+        fixture.viewModel.importVideoAudio("Recovered", "Artist", "Album", true)
+        waitUntil { extractor.enqueueCalls == 1 }
+        extractor.enqueueGate?.complete(Unit)
+
+        waitUntil { fixture.viewModel.videoImportState.value == recovered }
+        assertTrue(fixture.viewModel.videoImportDraft.value != null)
+        fixture.clear()
+    }
+
+    @Test
+    fun videoCancellationWaitsForDurablePublicationReconciliation() = runBlocking {
+        val reconciling = MediaOperationState.Processing(
+            currentFile = "正在完成已写入音轨",
+            completed = 0,
+            total = 1,
+            progressPercent = 99,
+        )
+        val extractor = FakeVideoAudioExtractor().apply {
+            stateAfterCancel = reconciling
+        }
+        val fixture = Fixture(videoExtractor = extractor)
+        val source = Uri.fromFile(application.cacheDir.resolve("cancel-during-publish.mp4"))
+
+        fixture.viewModel.prepareVideoImport(source)
+        waitUntil { fixture.viewModel.videoImportDraft.value != null }
+        fixture.viewModel.importVideoAudio("Publishing", "Artist", "Album", false)
+        waitUntil { fixture.viewModel.videoImportState.value is MediaOperationState.Processing }
+
+        fixture.viewModel.cancelVideoImport()
+        waitUntil { fixture.viewModel.videoImportState.value == reconciling }
+        assertFalse(fixture.viewModel.videoImportState.value is MediaOperationState.Cancelled)
+
+        extractor.state.value = MediaOperationState.Completed(
+            MediaOperationSummary(imported = 1, songId = 71L)
+        )
+        waitUntil { fixture.viewModel.videoImportState.value is MediaOperationState.Completed }
+        fixture.clear()
+    }
+
+    @Test
+    fun relocationStopsPlaybackPreventsSameFrameDoubleStartAndKeepsPartialResultAfterDenial() = runBlocking {
         val coordinator = FakeRelocationCoordinator(application)
         val fixture = Fixture(relocation = coordinator)
         fixture.viewModel.loadPlaylistMovePreview()
         waitUntil { fixture.viewModel.playlistMovePreview.value?.songCount == 3 }
 
         fixture.viewModel.startPlaylistMove("歌单汇总")
-        waitUntil { fixture.viewModel.playlistMoveState.value is MediaOperationState.Processing }
+        assertTrue(fixture.viewModel.playlistMoveState.value is MediaOperationState.Preparing)
         fixture.viewModel.startPlaylistMove("歌单汇总")
-        delay(100)
+        waitUntil { coordinator.startCalls == 1 }
         assertEquals(1, coordinator.startCalls)
         assertEquals(1, fixture.player.stopCount)
 
@@ -472,8 +568,19 @@ class MainViewModelInstrumentedTest {
     private class FakeVideoAudioExtractor : VideoAudioExtractor {
         val requests = mutableListOf<VideoImportRequest>()
         val state = MutableStateFlow<MediaOperationState>(MediaOperationState.Idle)
+        var enqueueCalls = 0
+        var enqueueGate: CompletableDeferred<Unit>? = null
+        var enqueueResult = true
+        var stateOnRejectedEnqueue: MediaOperationState? = null
+        var stateAfterCancel: MediaOperationState = MediaOperationState.Cancelled()
 
         override suspend fun enqueue(request: VideoImportRequest): Boolean {
+            enqueueCalls++
+            enqueueGate?.await()
+            if (!enqueueResult) {
+                stateOnRejectedEnqueue?.let { state.value = it }
+                return false
+            }
             if (state.value is MediaOperationState.Processing) return false
             requests += request
             state.value = MediaOperationState.Processing(request.title, 0, 1, 25)
@@ -481,7 +588,7 @@ class MainViewModelInstrumentedTest {
         }
 
         override suspend fun cancel() {
-            state.value = MediaOperationState.Cancelled()
+            state.value = stateAfterCancel
         }
 
         override suspend fun currentState(): MediaOperationState = state.value

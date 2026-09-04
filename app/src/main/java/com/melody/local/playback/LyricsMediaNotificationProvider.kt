@@ -27,6 +27,17 @@ internal class LyricsMediaNotificationProvider(
         snapshot = value
     }
 
+    override fun getNotificationContentTitle(metadata: MediaMetadata): CharSequence {
+        // Pre-Android 13 notifications keep the canonical song title while the accompanying
+        // MediaSession display title is temporarily used by compatible lock-screen surfaces.
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+            return metadata.title?.takeIf { it.isNotBlank() }
+                ?: super.getNotificationContentTitle(metadata)
+                ?: ""
+        }
+        return super.getNotificationContentTitle(metadata) ?: ""
+    }
+
     override fun getNotificationContentText(metadata: MediaMetadata): CharSequence {
         // Android 13+ renders MediaSession metadata directly; displayTitle carries the lyric there.
         // Keeping the custom secondary text as well would duplicate the same line.

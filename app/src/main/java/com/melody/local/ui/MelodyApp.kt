@@ -274,7 +274,7 @@ fun MelodyApp(
         systemLyricsSettingsRevision += 1f
         scope.launch {
             snackbarHostState.showSnackbar(
-                if (granted) "通知与锁屏歌词已启用" else "未授予通知权限"
+                if (granted) "通知歌词已启用；锁屏显示取决于系统" else "未授予通知权限"
             )
         }
     }
@@ -2121,6 +2121,11 @@ private fun PlaylistMoveDialog(
                     state is MediaOperationState.Failed -> {
                         Text("无法完成汇总", color = MaterialTheme.colorScheme.error)
                         Text(state.message, color = Muted)
+                        Text(
+                            "可选择“重试安全终止”。应用只会清理本次创建且仍处于待发布状态的目标；若无法确认归属，会继续保留文件和恢复记录。",
+                            color = Muted,
+                            fontSize = 12.sp,
+                        )
                     }
                     preview == null -> {
                         LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
@@ -2185,6 +2190,9 @@ private fun PlaylistMoveDialog(
         },
         dismissButton = {
             when {
+                state is MediaOperationState.Failed -> TextButton(onClick = onCancel) {
+                    Text("重试安全终止")
+                }
                 active -> TextButton(onClick = onCancel) { Text("取消任务") }
                 !terminal -> TextButton(onClick = onDismiss) { Text("返回") }
             }

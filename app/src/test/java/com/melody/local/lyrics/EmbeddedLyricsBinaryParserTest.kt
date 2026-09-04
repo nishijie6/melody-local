@@ -2,6 +2,7 @@ package com.melody.local.lyrics
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.ByteArrayOutputStream
 import java.nio.charset.StandardCharsets
@@ -24,12 +25,13 @@ class EmbeddedLyricsBinaryParserTest {
     }
 
     @Test
-    fun prefersSynchronizedId3LyricsAndConvertsMillisecondsToLrc() {
+    fun prefersSynchronizedId3LyricsAndPreservesEveryFieldTimestampAsEnhancedLrc() {
         val syltPayload = byteArrayOf(3) +
             "eng".toByteArray(StandardCharsets.ISO_8859_1) +
             byteArrayOf(2, 1, 0) +
-            "Hello".toByteArray(StandardCharsets.UTF_8) + byteArrayOf(0) + int32(1_230) +
-            "world".toByteArray(StandardCharsets.UTF_8) + byteArrayOf(0) + int32(2_500)
+            "Hello ".toByteArray(StandardCharsets.UTF_8) + byteArrayOf(0) + int32(1_234) +
+            "world\n".toByteArray(StandardCharsets.UTF_8) + byteArrayOf(0) + int32(2_506) +
+            "Next".toByteArray(StandardCharsets.UTF_8) + byteArrayOf(0) + int32(3_007)
         val usltPayload = byteArrayOf(3) +
             "eng".toByteArray(StandardCharsets.ISO_8859_1) + byteArrayOf(0) +
             "plain fallback".toByteArray(StandardCharsets.UTF_8)
@@ -38,7 +40,64 @@ class EmbeddedLyricsBinaryParserTest {
         val result = EmbeddedLyricsBinaryParser.parse(file)
 
         assertEquals(EmbeddedLyricsSource.ID3_SYLT, result?.source)
-        assertEquals("[00:01.23]Hello\n[00:02.50]world", result?.text)
+        assertEquals(
+            "[00:01.234]<00:01.234>Hello <00:02.506>world\n" +
+                "[00:03.007]<00:03.007>Next",
+            result?.text,
+        )
+        val parsed = LrcParser.parse(requireNotNull(result).text)
+        assertEquals(listOf("Hello world", "Next"), parsed.lines.map { it.text })
+        assertEquals(listOf(1_234L, 2_506L), parsed.lines.first().segments.map { it.timeMs })
+        assertEquals(listOf("Hello ", "world"), parsed.lines.first().segments.map { it.text })
+    }
+
+    @Test
+    fun boundsSyltGroupsSoGeneratedEnhancedLrcRemainsParseable() {
+        val entries = ByteArrayOutputStream().apply {
+            repeat(300) { index ->
+                write("x".toByteArray(StandardCharsets.UTF_8))
+                write(0)
+                write(int32(index * 10))
+            }
+        }.toByteArray()
+        val syltPayload = byteArrayOf(3) +
+            "eng".toByteArray(StandardCharsets.ISO_8859_1) +
+            byteArrayOf(2, 1, 0) + entries
+
+        val result = requireNotNull(EmbeddedLyricsBinaryParser.parse(id3v23(frame("SYLT", syltPayload))))
+        val parsed = LrcParser.parse(result.text)
+
+        assertEquals(2, parsed.lines.size)
+        assertTrue(parsed.lines.all { it.segments.size <= 256 })
+        assertEquals(300, parsed.lines.sumOf { it.segments.size })
+        assertEquals(2_990L, parsed.lines.last().segments.last().timeMs)
+    }
+
+    @Test
+    fun handlesId3v24GroupingDataLengthAndFrameUnsynchronizationPrefixes() {
+        val logicalPayload = byteArrayOf(0) +
+            "eng".toByteArray(StandardCharsets.ISO_8859_1) + byteArrayOf(0) +
+            byteArrayOf('A'.code.toByte(), 0xff.toByte(), 'B'.code.toByte())
+        val storedPayload = byteArrayOf(0x7f) +
+            syncSafe32(logicalPayload.size) +
+            addUnsynchronization(logicalPayload)
+        val file = id3v24(frameV24("USLT", storedPayload, flags = 0x0043))
+
+        val result = EmbeddedLyricsBinaryParser.parse(file)
+
+        assertEquals(EmbeddedLyricsSource.ID3_USLT, result?.source)
+        assertEquals("AÿB", result?.text)
+    }
+
+    @Test
+    fun rejectsMalformedOrUnsupportedId3v24FrameTransforms() {
+        val uslt = byteArrayOf(3) +
+            "eng".toByteArray(StandardCharsets.ISO_8859_1) + byteArrayOf(0) +
+            "lyrics".toByteArray(StandardCharsets.UTF_8)
+        val wrongLength = syncSafe32(uslt.size + 1) + uslt
+
+        assertNull(EmbeddedLyricsBinaryParser.parse(id3v24(frameV24("USLT", wrongLength, 0x0001))))
+        assertNull(EmbeddedLyricsBinaryParser.parse(id3v24(frameV24("USLT", uslt, 0x0008))))
     }
 
     @Test
@@ -108,8 +167,23 @@ class EmbeddedLyricsBinaryParserTest {
         'I'.code.toByte(), 'D'.code.toByte(), '3'.code.toByte(), 3, 0, 0,
     ) + syncSafe32(frames.size) + frames
 
+    private fun id3v24(frames: ByteArray): ByteArray = byteArrayOf(
+        'I'.code.toByte(), 'D'.code.toByte(), '3'.code.toByte(), 4, 0, 0,
+    ) + syncSafe32(frames.size) + frames
+
     private fun frame(id: String, payload: ByteArray): ByteArray =
         id.toByteArray(StandardCharsets.ISO_8859_1) + int32(payload.size) + byteArrayOf(0, 0) + payload
+
+    private fun frameV24(id: String, payload: ByteArray, flags: Int): ByteArray =
+        id.toByteArray(StandardCharsets.ISO_8859_1) + syncSafe32(payload.size) +
+            byteArrayOf((flags ushr 8).toByte(), flags.toByte()) + payload
+
+    private fun addUnsynchronization(bytes: ByteArray): ByteArray = ByteArrayOutputStream().apply {
+        bytes.forEach { byte ->
+            write(byte.toInt())
+            if (byte == 0xff.toByte()) write(0)
+        }
+    }.toByteArray()
 
     private fun atom(type: String, payload: ByteArray): ByteArray =
         atom(type.toByteArray(StandardCharsets.ISO_8859_1), payload)

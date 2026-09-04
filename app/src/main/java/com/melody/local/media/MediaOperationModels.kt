@@ -2,6 +2,11 @@ package com.melody.local.media
 
 import android.net.Uri
 
+// MediaStore introduced the named-volume constant in API 29, but the URI segment itself is a
+// stable wire value. Keeping the value here lets recovery code validate persisted URIs on every
+// supported API without referencing an inlined newer-SDK field from minSdk 26 code.
+internal const val PRIMARY_EXTERNAL_MEDIA_VOLUME = "external_primary"
+
 sealed interface MediaOperationState {
     data object Idle : MediaOperationState
     data class Preparing(val message: String) : MediaOperationState
@@ -57,7 +62,47 @@ enum class AudioExportStrategy { PASSTHROUGH_AAC, TRANSCODE_TO_AAC }
 
 internal enum class SongRelocationRoute { LEGACY_FILE_MOVE, IN_PLACE_MEDIASTORE, COPY_VERIFY_DELETE }
 
-internal enum class MoveRecoveryAction { CLEAN_TARGET_AND_RETRY, COMMIT_REMAP, CONTINUE }
+internal enum class MoveRecoveryAction { RETAIN_TARGET_FOR_RECOVERY, COMMIT_REMAP, CONTINUE }
+
+internal enum class LegacyPreparedRecoveryAction {
+    COMMIT_EXISTING_ROW,
+    COMMIT_VERIFIED_DESTINATION,
+    RETAIN_VERIFIED_TARGET,
+    CLEAN_TARGET_AND_RETRY,
+    FAIL_WITHOUT_DELETING_TARGET,
+}
+
+internal enum class DeletionIntegrityResult { VERIFIED, SOURCE_CHANGED, DESTINATION_CHANGED }
+
+/**
+ * Result of querying one concrete MediaStore volume for one row ID.
+ *
+ * [Absent] is deliberately different from [Inaccessible]: only a successfully returned cursor
+ * with no row proves absence. A provider exception or a null cursor must stop bare-ID resolution,
+ * otherwise a row with the same numeric ID on another volume could be selected by mistake.
+ */
+internal sealed interface MediaRowQueryResult<out T> {
+    data class Found<T>(val value: T) : MediaRowQueryResult<T>
+    data object Absent : MediaRowQueryResult<Nothing>
+    data object Inaccessible : MediaRowQueryResult<Nothing>
+}
+
+internal fun <T> completeMediaRowQuery(
+    results: Iterable<MediaRowQueryResult<T>>,
+): List<T>? {
+    val values = mutableListOf<T>()
+    results.forEach { result ->
+        when (result) {
+            is MediaRowQueryResult.Found -> values += result.value
+            MediaRowQueryResult.Absent -> Unit
+            MediaRowQueryResult.Inaccessible -> return null
+        }
+    }
+    return values
+}
+
+internal fun <T> MediaRowQueryResult<T>.valueOrNull(): T? =
+    (this as? MediaRowQueryResult.Found)?.value
 
 internal fun audioExportStrategy(mimeType: String?): AudioExportStrategy =
     if (mimeType.equals("audio/mp4a-latm", ignoreCase = true) ||
@@ -72,7 +117,7 @@ internal fun deduplicateSongIds(songIds: Iterable<Long>): List<Long> = songIds.d
 
 internal fun relocationRoute(apiLevel: Int, volumeName: String?): SongRelocationRoute = when {
     apiLevel < 29 -> SongRelocationRoute.LEGACY_FILE_MOVE
-    volumeName == "external_primary" || volumeName == "external" ->
+    volumeName == "external_primary" ->
         SongRelocationRoute.IN_PLACE_MEDIASTORE
     else -> SongRelocationRoute.COPY_VERIFY_DELETE
 }
@@ -91,12 +136,57 @@ internal fun moveRecoveryAction(
     sourceExists: Boolean,
 ): MoveRecoveryAction = when {
     status == com.melody.local.data.MoveItemStatus.COPIED && sourceExists ->
-        MoveRecoveryAction.CLEAN_TARGET_AND_RETRY
+        MoveRecoveryAction.RETAIN_TARGET_FOR_RECOVERY
     status == com.melody.local.data.MoveItemStatus.SOURCE_DELETED ||
         (status == com.melody.local.data.MoveItemStatus.COPIED && !sourceExists) ->
         MoveRecoveryAction.COMMIT_REMAP
     else -> MoveRecoveryAction.CONTINUE
 }
+
+internal fun legacyPreparedRecoveryAction(
+    mediaRowPointsAtDestination: Boolean,
+    sourcePresent: Boolean,
+    destinationVerified: Boolean,
+): LegacyPreparedRecoveryAction = when {
+    mediaRowPointsAtDestination && destinationVerified ->
+        LegacyPreparedRecoveryAction.COMMIT_EXISTING_ROW
+    mediaRowPointsAtDestination -> LegacyPreparedRecoveryAction.FAIL_WITHOUT_DELETING_TARGET
+    !sourcePresent && destinationVerified ->
+        LegacyPreparedRecoveryAction.COMMIT_VERIFIED_DESTINATION
+    sourcePresent && destinationVerified ->
+        LegacyPreparedRecoveryAction.RETAIN_VERIFIED_TARGET
+    sourcePresent -> LegacyPreparedRecoveryAction.CLEAN_TARGET_AND_RETRY
+    else -> LegacyPreparedRecoveryAction.FAIL_WITHOUT_DELETING_TARGET
+}
+
+internal fun pendingMoveDestinationMarker(operationId: String, oldSongId: Long): String =
+    "yinlan-pending-move:$operationId:$oldSongId"
+
+internal fun isSyntheticExternalMediaUri(uri: String): Boolean =
+    SYNTHETIC_EXTERNAL_MEDIA_URI.matches(uri.substringBefore('?'))
+
+internal fun mediaStorePublishSucceeded(updatedRows: Int): Boolean = updatedRows == 1
+
+internal fun pendingDeletionIntegrityResult(
+    destinationMatches: () -> Boolean,
+    sourceMatches: () -> Boolean,
+): DeletionIntegrityResult = when {
+    !destinationMatches() -> DeletionIntegrityResult.DESTINATION_CHANGED
+    !sourceMatches() -> DeletionIntegrityResult.SOURCE_CHANGED
+    else -> DeletionIntegrityResult.VERIFIED
+}
+
+internal fun concreteDestinationIdentityIsUnique(
+    destinationUri: String,
+    candidateUris: List<String>,
+): Boolean = candidateUris.size == 1 && candidateUris.single() == destinationUri
+
+internal fun orderPendingMoveOperations(
+    operations: Iterable<com.melody.local.data.MoveOperationRecord>,
+): List<com.melody.local.data.MoveOperationRecord> =
+    operations.sortedWith(
+        compareBy<com.melody.local.data.MoveOperationRecord> { it.createdAt }.thenBy { it.id }
+    )
 
 internal fun defaultVideoTitle(displayName: String?): String {
     val name = displayName?.trim().orEmpty()
@@ -142,3 +232,6 @@ internal fun uniqueDisplayName(desired: String, existingNames: Collection<String
 }
 
 private val INVALID_FILE_NAME_CHARACTERS = setOf('\\', '/', ':', '*', '?', '"', '<', '>', '|')
+
+private val SYNTHETIC_EXTERNAL_MEDIA_URI =
+    Regex("^content://(?:[0-9]+@)?media/external/.*$", RegexOption.IGNORE_CASE)

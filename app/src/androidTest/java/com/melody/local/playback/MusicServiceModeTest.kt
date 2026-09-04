@@ -16,11 +16,13 @@ import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.google.common.util.concurrent.ListenableFuture
+import com.melody.local.systemlyrics.SystemLyricsSettings
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
+import java.io.File
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 
@@ -116,6 +118,55 @@ class MusicServiceModeTest {
         assertEquals(false, unknownResult.resultCode == SessionResult.RESULT_SUCCESS)
     }
 
+    @Test
+    fun sessionMetadataExposesCurrentLyricAndRestoresOriginalDisplayFields() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val settings = SystemLyricsSettings(context)
+        val originalSetting = settings.notificationLyricsEnabled
+        val mediaId = "9000000000007"
+        val lyricFile = File(context.filesDir, "lyrics/$mediaId.lrc")
+        lyricFile.parentFile?.mkdirs()
+        lyricFile.writeText("[00:01.000]当前歌词\n[00:03.000]下一句", Charsets.UTF_8)
+        try {
+            settings.notificationLyricsEnabled = true
+            val metadata = MediaMetadata.Builder()
+                .setTitle("原始歌名")
+                .setArtist("原始歌手")
+                .setDisplayTitle("原始显示标题")
+                .setSubtitle("原始副标题")
+                .build()
+            onControllerThread {
+                setMediaItems(
+                    listOf(
+                        MediaItem.Builder()
+                            .setMediaId(mediaId)
+                            .setUri(Uri.parse("file:///nonexistent/$mediaId.mp3"))
+                            .setMediaMetadata(metadata)
+                            .build()
+                    ),
+                    0,
+                    1_500L,
+                )
+            }
+
+            val lyricMetadata = awaitCurrentMetadata { it.displayTitle?.toString() == "当前歌词" }
+            assertEquals("原始歌名", lyricMetadata.title?.toString())
+            assertEquals("原始歌手", lyricMetadata.artist?.toString())
+            assertEquals("原始歌名 · 原始歌手", lyricMetadata.subtitle?.toString())
+
+            settings.notificationLyricsEnabled = false
+            val restored = awaitCurrentMetadata {
+                it.displayTitle?.toString() == "原始显示标题"
+            }
+            assertEquals("原始副标题", restored.subtitle?.toString())
+            assertEquals("原始歌名", restored.title?.toString())
+            assertEquals("原始歌手", restored.artist?.toString())
+        } finally {
+            settings.notificationLyricsEnabled = originalSetting
+            lyricFile.delete()
+        }
+    }
+
     private fun assertMode(mode: PlaybackMode) {
         val future = onControllerThread {
             sendCustomCommand(SET_PLAYBACK_MODE_COMMAND, playbackModeBundle(mode))
@@ -149,6 +200,20 @@ class MusicServiceModeTest {
     private fun MediaController.mediaIds(): List<String> =
         List(mediaItemCount) { index -> getMediaItemAt(index).mediaId }
 
+    private fun awaitCurrentMetadata(
+        timeoutMs: Long = 10_000L,
+        predicate: (MediaMetadata) -> Boolean,
+    ): MediaMetadata {
+        val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs)
+        var latest = MediaMetadata.EMPTY
+        while (System.nanoTime() < deadline) {
+            latest = onControllerThread { currentMediaItem?.mediaMetadata ?: MediaMetadata.EMPTY }
+            if (predicate(latest)) return latest
+            Thread.sleep(50L)
+        }
+        throw AssertionError("Timed out waiting for media metadata; latest=$latest")
+    }
+
     private fun <T> onControllerThread(block: MediaController.() -> T): T {
         val result = AtomicReference<Result<T>>()
         InstrumentationRegistry.getInstrumentation().runOnMainSync {
@@ -157,4 +222,3 @@ class MusicServiceModeTest {
         return result.get().getOrThrow()
     }
 }
-

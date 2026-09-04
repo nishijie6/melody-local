@@ -1,7 +1,6 @@
 package com.melody.local.playback
 
 import android.content.Context
-import android.os.Build
 import android.os.Bundle
 import androidx.annotation.OptIn
 import androidx.core.content.edit
@@ -219,12 +218,12 @@ class MusicService : MediaSessionService() {
     }
 
     /**
-     * Android 13+ builds the lock-screen/System UI media card from session metadata rather than a
-     * custom notification provider. Updating displayTitle/subtitle is the supported Media3 path;
-     * title/artist/album remain untouched so in-app metadata and queue identity stay stable.
+     * System media surfaces read the current MediaSession item on every supported API level.
+     * Updating displayTitle/subtitle gives pre-Android 13 lock screens the same best-effort metadata
+     * as the Android 13+ media card. title/artist/album remain untouched, and the original display
+     * fields are restored when lyrics should no longer be exposed.
      */
     private fun updateSystemUiLyricMetadata(player: Player, snapshot: SystemLyricSnapshot) {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
         var item = player.currentMediaItem
         var index = player.currentMediaItemIndex
         if (item == null || index == C.INDEX_UNSET) {

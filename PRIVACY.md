@@ -46,7 +46,7 @@ On Android 10, modifying user-owned MediaStore rows may show one system confirma
 
 Declining notification permission does not give the app network access. Declining audio permission prevents the app from showing the local music library.
 
-When notification/lock-screen lyrics are enabled, the current lyric line is exposed to Android System UI as part of the media session. Before Android 13 it is used as notification secondary text; on Android 13 and newer the app uses Media3 `displayTitle`/`subtitle` metadata for the lock-screen media card. The operating system, connected media controllers and device-manufacturer UI determine where that metadata is visible. Disabling the setting restores ordinary song metadata.
+When notification/lock-screen lyrics are enabled, the current lyric line is exposed to Android System UI through Media3 `displayTitle`/`subtitle` metadata on every supported Android version. Before Android 13 the app also places it in notification secondary text while retaining the canonical song title; Android 13 and newer build the system media card directly from session metadata. The operating system, connected media controllers and device-manufacturer UI determine where that metadata is visible, especially on older lock screens. Disabling the setting restores the original display metadata.
 
 Automatic output-delay compensation reads only the output device types available through Android's public audio-route API. It does not capture audio, access a microphone, inspect Bluetooth codec traffic or measure true end-to-end latency. Classic Bluetooth, Bluetooth LE, HDMI and USB receive conservative category estimates, and any per-route manual correction remains on the device.
 

@@ -33,6 +33,18 @@ class LyricsMatchScorerTest {
     }
 
     @Test
+    fun `actual display name wins when editable title metadata is unrelated`() {
+        val ranked = LyricsMatchScorer.rankLocal(
+            track.copy(title = "歌曲名", sourceFileName = "01.mp3"),
+            listOf(candidate("01.lrc")),
+        )
+
+        assertEquals(100, ranked.single().score)
+        assertEquals(LocalMatchReason.SAME_AUDIO_FILE_NAME, ranked.single().reason)
+        assertTrue(ranked.single().canAutoImport)
+    }
+
+    @Test
     fun `title and artist forms have deterministic priority`() {
         val ranked = LyricsMatchScorer.rankLocal(
             track.copy(sourceFileName = null),

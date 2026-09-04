@@ -61,6 +61,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
+import java.util.concurrent.atomic.AtomicBoolean
 
 internal fun filterAndSortSongs(
     songs: List<Song>,
@@ -217,7 +218,9 @@ class MainViewModel internal constructor(
         _authorizationRequest.asStateFlow()
 
     private var videoMonitorJob: Job? = null
+    private val videoEnqueueInFlight = AtomicBoolean(false)
     private var relocationJob: Job? = null
+    private val relocationStartInFlight = AtomicBoolean(false)
     private var lyricsSearchJob: Job? = null
     private var lyricsSearchRequestId = 0L
     private var lyricsEditorJob: Job? = null
@@ -240,18 +243,32 @@ class MainViewModel internal constructor(
         }
         if (videoAudioExtractor != null) monitorVideoImport(showCompletionMessage = false)
         if (songRelocationCoordinator != null) {
+            // Recovery admission must be visible before the coroutine is dispatched. Otherwise a
+            // tap in the first UI frame can race recovery and ask the coordinator to start a
+            // second destructive operation. The coordinator independently guards its journal;
+            // this synchronous state is the UI-side half of the same invariant.
+            relocationStartInFlight.set(true)
+            _playlistMoveState.value = MediaOperationState.Preparing("正在检查未完成的文件移动…")
             relocationJob = viewModelScope.launch {
-                val recovered = runCatching {
-                    withContext(Dispatchers.IO) {
-                        songRelocationCoordinator.recover(::updateMoveState)
+                try {
+                    val recovered = runCatching {
+                        withContext(Dispatchers.IO) {
+                            songRelocationCoordinator.recover(::updateMoveState)
+                        }
+                    }.getOrElse { error ->
+                        updateMoveState(
+                            MediaOperationState.Failed(error.message ?: "无法恢复上次的文件移动")
+                        )
+                        null
                     }
-                }.getOrElse { error ->
-                    updateMoveState(
-                        MediaOperationState.Failed(error.message ?: "无法恢复上次的文件移动")
-                    )
-                    null
+                    if (recovered != null) {
+                        handleRelocationStep(recovered)
+                    } else if (_playlistMoveState.value is MediaOperationState.Preparing) {
+                        _playlistMoveState.value = MediaOperationState.Idle
+                    }
+                } finally {
+                    relocationStartInFlight.set(false)
                 }
-                if (recovered != null) handleRelocationStep(recovered)
             }
         }
     }
@@ -367,32 +384,64 @@ class MainViewModel internal constructor(
             return
         }
         val extractor = videoAudioExtractor ?: return
+        val previousState = _videoImportState.value
+        if (previousState.isBusy() || !videoEnqueueInFlight.compareAndSet(false, true)) {
+            _messages.tryEmit("已有视频音轨正在导入")
+            return
+        }
+        // Set the busy state before launching so two taps in the same UI frame cannot both reach
+        // the suspend enqueue call.
+        _videoImportState.value = MediaOperationState.Preparing("正在准备视频音轨…")
         viewModelScope.launch {
-            val enqueued = extractor.enqueue(
-                VideoImportRequest(
-                    uri = draft.uri,
-                    title = title.trim(),
-                    artist = artist.trim().ifBlank { "未知歌手" },
-                    album = album.trim().ifBlank { "视频提取" },
-                    extractArtwork = extractArtwork,
+            try {
+                val enqueued = extractor.enqueue(
+                    VideoImportRequest(
+                        uri = draft.uri,
+                        title = title.trim(),
+                        artist = artist.trim().ifBlank { "未知歌手" },
+                        album = album.trim().ifBlank { "视频提取" },
+                        extractArtwork = extractArtwork,
+                    )
                 )
-            )
-            if (!enqueued) {
-                _messages.emit("已有视频音轨正在导入")
-                return@launch
+                if (!enqueued) {
+                    _messages.emit("已有视频音轨正在导入")
+                    // enqueue(false) can also mean WorkManager/receipt recovery found an already
+                    // accepted request after the startup monitor briefly observed Idle. Keep a
+                    // busy admission state and reattach the monitor instead of leaving a real
+                    // background import with no UI progress or completion refresh.
+                    monitorVideoImport(showCompletionMessage = true)
+                    return@launch
+                }
+                _videoImportDraft.value = null
+                monitorVideoImport(showCompletionMessage = true)
+            } catch (cancelled: CancellationException) {
+                _videoImportState.value = previousState
+                throw cancelled
+            } catch (error: Exception) {
+                _videoImportState.value = previousState
+                _messages.emit(error.message ?: "无法启动视频音轨导入")
+            } finally {
+                videoEnqueueInFlight.set(false)
             }
-            _videoImportDraft.value = null
-            _videoImportState.value = MediaOperationState.Preparing("正在准备视频音轨…")
-            monitorVideoImport(showCompletionMessage = true)
         }
     }
 
     fun cancelVideoImport() {
         val extractor = videoAudioExtractor ?: return
+        _videoImportState.value = MediaOperationState.Preparing("正在确认视频导入取消状态…")
         viewModelScope.launch {
-            extractor.cancel()
-            _videoImportState.value = MediaOperationState.Cancelled()
-            _messages.emit("视频音轨导入已取消")
+            runCatching { extractor.cancel() }
+                .onSuccess {
+                    // WorkManager can expose CANCELLED before a PREPARED worker finishes its
+                    // mandatory publication/scanner section. Reattach and let durable receipts
+                    // decide between true Cancelled, Completed or recoverable Failed.
+                    monitorVideoImport(showCompletionMessage = true)
+                }
+                .onFailure { error ->
+                    _videoImportState.value = MediaOperationState.Failed(
+                        error.message ?: "无法取消视频音轨导入"
+                    )
+                }
         }
     }
 
@@ -420,22 +469,31 @@ class MainViewModel internal constructor(
 
     fun startPlaylistMove(folderName: String) {
         val coordinator = songRelocationCoordinator ?: return
-        if (_playlistMoveState.value.isBusy()) {
+        if (_playlistMoveState.value.isBusy() ||
+            !relocationStartInFlight.compareAndSet(false, true)
+        ) {
             _messages.tryEmit("已有歌单歌曲汇总任务正在进行")
             return
         }
+        // Enter a busy state synchronously so two taps in the same UI frame cannot queue two
+        // destructive operations before the first coroutine starts executing.
+        _playlistMoveState.value = MediaOperationState.Preparing("正在准备汇总歌单歌曲…")
         player.stop()
         relocationJob = viewModelScope.launch {
-            val step = runCatching {
-                withContext(Dispatchers.IO) {
-                    coordinator.start(folderName, ::updateMoveState)
+            try {
+                val step = runCatching {
+                    withContext(Dispatchers.IO) {
+                        coordinator.start(folderName, ::updateMoveState)
+                    }
+                }.getOrElse { error ->
+                    val failed = MediaOperationState.Failed(error.message ?: "汇总歌单歌曲失败")
+                    updateMoveState(failed)
+                    RelocationStep.Finished(failed)
                 }
-            }.getOrElse { error ->
-                val failed = MediaOperationState.Failed(error.message ?: "汇总歌单歌曲失败")
-                updateMoveState(failed)
-                RelocationStep.Finished(failed)
+                handleRelocationStep(step)
+            } finally {
+                relocationStartInFlight.set(false)
             }
-            handleRelocationStep(step)
         }
     }
 
@@ -731,6 +789,10 @@ class MainViewModel internal constructor(
             while (true) {
                 val state = runCatching { extractor.currentState() }
                     .getOrElse { MediaOperationState.Failed(it.message ?: "无法读取导入进度") }
+                if (state is MediaOperationState.Idle && videoEnqueueInFlight.get()) {
+                    delay(100L)
+                    continue
+                }
                 _videoImportState.value = state
                 if (state.isTerminal()) {
                     if (state is MediaOperationState.Completed) refreshSongs()

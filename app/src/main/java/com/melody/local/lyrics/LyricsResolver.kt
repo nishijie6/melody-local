@@ -1,7 +1,9 @@
 package com.melody.local.lyrics
 
 import android.content.Context
+import android.database.Cursor
 import android.net.Uri
+import android.provider.OpenableColumns
 import androidx.core.net.toUri
 import com.melody.local.data.Song
 import com.melody.local.lyrics.discovery.LrclibLyricsSource
@@ -15,8 +17,10 @@ import com.melody.local.lyrics.discovery.RankedOnlineLyrics
 import com.melody.local.lyrics.discovery.RemoteLyricsResult
 import com.melody.local.lyrics.discovery.toLyricsTrack
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import java.util.concurrent.ConcurrentHashMap
 
 enum class LyricsOrigin {
@@ -36,6 +40,48 @@ interface LyricsResolverApi : AutomaticLyricsResolver {
     suspend fun resolve(song: Song, allowOnline: Boolean): LyricsResolution
     suspend fun searchOnline(song: Song, keywords: String? = null): LyricsResolution
     suspend fun applyOnline(songId: Long, result: RankedOnlineLyrics): LyricsResolution
+}
+
+/** Resolves the actual file name behind a song URI without relying on editable title metadata. */
+fun interface LyricsSourceFileNameLookup {
+    suspend fun find(contentUri: Uri): String?
+}
+
+private fun interface LyricsDisplayNameQuery {
+    fun query(contentUri: Uri, projection: Array<String>): Cursor?
+}
+
+class ContentResolverLyricsSourceFileNameLookup private constructor(
+    private val query: LyricsDisplayNameQuery,
+) : LyricsSourceFileNameLookup {
+    constructor(context: Context) : this(
+        LyricsDisplayNameQuery { contentUri, projection ->
+            context.applicationContext.contentResolver.query(
+                contentUri,
+                projection,
+                null,
+                null,
+                null,
+            )
+        }
+    )
+
+    internal constructor(query: (Uri, Array<String>) -> Cursor?) : this(
+        LyricsDisplayNameQuery(query)
+    )
+
+    override suspend fun find(contentUri: Uri): String? = withContext(Dispatchers.IO) {
+        runCatching {
+            query.query(
+                contentUri,
+                arrayOf(OpenableColumns.DISPLAY_NAME),
+            )?.use { cursor ->
+                if (!cursor.moveToFirst()) return@use null
+                val column = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                if (column < 0 || cursor.isNull(column)) null else cursor.getString(column)
+            }?.trim()?.takeIf(String::isNotBlank)
+        }.getOrNull()
+    }
 }
 
 sealed interface LyricsResolution {
@@ -59,6 +105,8 @@ class LyricsResolver(
         clientIdentifier = "Yinlan/1.4.0 (https://github.com/nishijie6/melody-local)",
     ),
     extraLocalSources: List<LocalLyricsSource> = emptyList(),
+    private val sourceFileNameLookup: LyricsSourceFileNameLookup =
+        ContentResolverLyricsSourceFileNameLookup(context),
 ) : LyricsResolverApi {
     private val songUris = ConcurrentHashMap<Long, Uri>()
     private val resolutionLocks = ConcurrentHashMap<Long, Mutex>()
@@ -87,7 +135,7 @@ class LyricsResolver(
         // one process-wide resolver lock avoids duplicate directory scans and online requests.
         store.load(song.id)?.let { return@withLock LyricsResolution.Applied(it, LyricsOrigin.CACHED) }
         songUris[song.id] = song.contentUri
-        val track = song.toLyricsTrack()
+        val track = song.toLyricsTrack(sourceFileName(song))
         for ((index, source) in localSources.withIndex()) {
             when (val lookup = source.find(track)) {
                 is LocalLyricsLookup.Found -> if (lookup.best.canAutoImport) {
@@ -137,7 +185,7 @@ class LyricsResolver(
         songUris[song.id] = song.contentUri
         return searchAndMaybeApply(
             songId = song.id,
-            track = song.toLyricsTrack(),
+            track = song.toLyricsTrack(sourceFileName(song)),
             keywords = keywords,
             autoApply = false,
         )
@@ -206,6 +254,9 @@ class LyricsResolver(
         is RemoteLyricsResult.RateLimited -> LyricsResolution.RateLimited(result.retryAfterSeconds)
         is RemoteLyricsResult.ServiceFailure -> LyricsResolution.Failure(result.message)
     }
+
+    private suspend fun sourceFileName(song: Song): String? =
+        failureAsNull { sourceFileNameLookup.find(song.contentUri) }
 
     private suspend fun <T> failureAsNull(block: suspend () -> T): T? = try {
         block()

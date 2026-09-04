@@ -166,7 +166,13 @@ internal fun LyricsSettingsDialog(
                     )
                     if (!overlayPermissionGranted) Text("开启时会进入 Android 系统页面授予悬浮窗权限。")
                 }
-                item { SettingSwitch("通知与锁屏显示当前歌词", notificationLyricsEnabled, onNotificationChange) }
+                item {
+                    SettingSwitch(
+                        "通知显示当前歌词（锁屏视系统支持）",
+                        notificationLyricsEnabled,
+                        onNotificationChange,
+                    )
+                }
                 if (!notificationPermissionGranted) {
                     item { Text("Android 通知权限尚未授予；开启该项时会请求系统授权。") }
                 }
