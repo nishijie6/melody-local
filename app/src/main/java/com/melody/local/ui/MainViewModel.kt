@@ -57,6 +57,7 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -222,8 +223,10 @@ class MainViewModel internal constructor(
     private var relocationJob: Job? = null
     private val relocationStartInFlight = AtomicBoolean(false)
     private var lyricsSearchJob: Job? = null
+    private var lyricsSearchOwnerSongId: Long? = null
     private var lyricsSearchRequestId = 0L
     private var lyricsEditorJob: Job? = null
+    private var lyricsEditorJobSongId: Long? = null
     private var lyricsEditorRequestId = 0L
 
     init {
@@ -233,13 +236,19 @@ class MainViewModel internal constructor(
                 // previous song. Never let that stale callback cancel search/editor work that
                 // already belongs to the latest playback item.
                 if (songId != playback.value.mediaId) return@collect
-                lyricsSearchRequestId++
-                lyricsSearchJob?.cancel()
-                lyricsSearchJob = null
-                _lyricsSearchState.value = LyricsSearchUiState.Idle
-                lyricsEditorRequestId++
-                lyricsEditorJob?.cancel()
-                lyricsEditorJob = null
+                if (lyricsSearchOwnerSongId != songId) {
+                    lyricsSearchRequestId++
+                    lyricsSearchJob?.cancel()
+                    lyricsSearchJob = null
+                    lyricsSearchOwnerSongId = null
+                    _lyricsSearchState.value = LyricsSearchUiState.Idle
+                }
+                if (lyricsEditorJobSongId != songId) {
+                    lyricsEditorRequestId++
+                    lyricsEditorJob?.cancel()
+                    lyricsEditorJob = null
+                    lyricsEditorJobSongId = null
+                }
                 if (_lyricsEditorDraft.value?.songId != songId) {
                     _lyricsEditorDraft.value = null
                 }
@@ -573,7 +582,8 @@ class MainViewModel internal constructor(
         val songId = playback.value.mediaId ?: return
         lyricsEditorJob?.cancel()
         val requestId = ++lyricsEditorRequestId
-        lyricsEditorJob = viewModelScope.launch {
+        lyricsEditorJobSongId = songId
+        val job = viewModelScope.launch(start = CoroutineStart.LAZY) {
             try {
                 val text = lyricsRepository.readRaw(songId).orEmpty()
                 if (requestId == lyricsEditorRequestId && playback.value.mediaId == songId) {
@@ -586,15 +596,21 @@ class MainViewModel internal constructor(
                     _messages.emit(error.message ?: "无法打开歌词编辑器")
                 }
             } finally {
-                if (requestId == lyricsEditorRequestId) lyricsEditorJob = null
+                if (requestId == lyricsEditorRequestId) {
+                    lyricsEditorJob = null
+                    lyricsEditorJobSongId = null
+                }
             }
         }
+        lyricsEditorJob = job
+        job.start()
     }
 
     fun dismissLyricsEditor() {
         lyricsEditorRequestId++
         lyricsEditorJob?.cancel()
         lyricsEditorJob = null
+        lyricsEditorJobSongId = null
         _lyricsEditorDraft.value = null
     }
 
@@ -651,6 +667,7 @@ class MainViewModel internal constructor(
         lyricsSearchRequestId++
         lyricsSearchJob?.cancel()
         lyricsSearchJob = null
+        lyricsSearchOwnerSongId = null
         _lyricsSearchState.value = LyricsSearchUiState.Idle
     }
 
@@ -704,8 +721,9 @@ class MainViewModel internal constructor(
     ) {
         lyricsSearchJob?.cancel()
         val requestId = ++lyricsSearchRequestId
+        lyricsSearchOwnerSongId = songId
         _lyricsSearchState.value = LyricsSearchUiState.Loading
-        lyricsSearchJob = viewModelScope.launch {
+        val job = viewModelScope.launch(start = CoroutineStart.LAZY) {
             val resolution = try {
                 request()
             } catch (cancelled: CancellationException) {
@@ -715,8 +733,12 @@ class MainViewModel internal constructor(
             }
             if (requestId != lyricsSearchRequestId || playback.value.mediaId != songId) return@launch
             handleLyricsResolution(songId, resolution, announce)
-            if (requestId == lyricsSearchRequestId) lyricsSearchJob = null
+            if (requestId == lyricsSearchRequestId) {
+                lyricsSearchJob = null
+            }
         }
+        lyricsSearchJob = job
+        job.start()
     }
 
     private suspend fun handleLyricsResolution(

@@ -218,7 +218,7 @@ class MainViewModelInstrumentedTest {
 
         fixture.player.mutableState.value = PlaybackUiState(mediaId = 1L)
         fixture.viewModel.searchOnlineLyrics()
-        resolver.firstSearchStarted.await()
+        withTimeout(5_000L) { resolver.firstSearchStarted.await() }
 
         fixture.player.mutableState.value = PlaybackUiState(mediaId = 2L)
         waitUntil { fixture.viewModel.lyricsSearchState.value == LyricsSearchUiState.Idle }
