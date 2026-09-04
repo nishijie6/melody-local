@@ -168,7 +168,7 @@ internal fun pendingMoveDestinationMarker(operationId: String, oldSongId: Long):
  * final name only after the audio bytes have been verified.
  */
 internal fun pendingMoveDestinationDisplayName(operationId: String, oldSongId: Long): String =
-    "yinlan-pending-move-$operationId-$oldSongId.tmp"
+    "yinlan-pending-move-$operationId-$oldSongId"
 
 internal fun isSyntheticExternalMediaUri(uri: String): Boolean =
     SYNTHETIC_EXTERNAL_MEDIA_URI.matches(uri.substringBefore('?'))

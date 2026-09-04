@@ -882,20 +882,24 @@ class MediaStoreSongRelocationCoordinator(
                 long(MediaStore.Audio.Media._ID) == item.newSongId &&
                     long(MediaStore.Audio.Media.IS_PENDING) == 1L &&
                     (displayName.equals(item.displayName, ignoreCase = true) ||
-                        displayName == pendingMoveDestinationDisplayName(
-                            item.operationId,
-                            item.oldSongId,
-                        )) &&
+                        displayName?.startsWith(
+                            pendingMoveDestinationDisplayName(
+                                item.operationId,
+                                item.oldSongId,
+                            ),
+                        ) == true) &&
                     string(MediaStore.Audio.Media.RELATIVE_PATH)
                         .equals(operation.targetRelativePath, ignoreCase = true) &&
                     string(MediaStore.MediaColumns.VOLUME_NAME)
                         .equals(PRIMARY_EXTERNAL_MEDIA_VOLUME, ignoreCase = true) &&
                     (title == pendingMoveDestinationMarker(item.operationId, item.oldSongId) ||
                         title == source.title ||
-                        displayName == pendingMoveDestinationDisplayName(
-                            item.operationId,
-                            item.oldSongId,
-                        ))
+                        displayName?.startsWith(
+                            pendingMoveDestinationDisplayName(
+                                item.operationId,
+                                item.oldSongId,
+                            ),
+                        ) == true)
             }
         }.getOrDefault(false)
     }
@@ -2293,17 +2297,21 @@ class MediaStoreSongRelocationCoordinator(
                     cursor.getInt(1) == 1 &&
                     (!requireDisplayName ||
                         displayName.equals(item.displayName, ignoreCase = true) ||
-                        displayName == pendingMoveDestinationDisplayName(
-                            item.operationId,
-                            item.oldSongId,
-                        )) &&
+                        displayName?.startsWith(
+                            pendingMoveDestinationDisplayName(
+                                item.operationId,
+                                item.oldSongId,
+                            ),
+                        ) == true) &&
                     (expectedRelativePath == null ||
                         cursor.getString(3).equals(expectedRelativePath, ignoreCase = true)) &&
                     (!requireRecoveryMarker ||
-                        displayName == pendingMoveDestinationDisplayName(
-                            item.operationId,
-                            item.oldSongId,
-                        ) || cursor.getString(4) == pendingMoveDestinationMarker(
+                        displayName?.startsWith(
+                            pendingMoveDestinationDisplayName(
+                                item.operationId,
+                                item.oldSongId,
+                            ),
+                        ) == true || cursor.getString(4) == pendingMoveDestinationMarker(
                             item.operationId,
                             item.oldSongId,
                         )) &&
@@ -2410,12 +2418,12 @@ class MediaStoreSongRelocationCoordinator(
             arrayOf(MediaStore.Audio.Media._ID),
             "${MediaStore.Audio.Media.RELATIVE_PATH} = ? AND " +
                 "(${MediaStore.Audio.Media.TITLE} = ? OR " +
-                "${MediaStore.Audio.Media.DISPLAY_NAME} = ?) AND " +
+                "${MediaStore.Audio.Media.DISPLAY_NAME} LIKE ?) AND " +
                 "${MediaStore.Audio.Media.IS_PENDING} = 1",
             arrayOf(
                 operation.targetRelativePath,
                 pendingMoveDestinationMarker(item.operationId, item.oldSongId),
-                pendingMoveDestinationDisplayName(item.operationId, item.oldSongId),
+                "${pendingMoveDestinationDisplayName(item.operationId, item.oldSongId)}%",
             ),
             null,
         ) ?: throw IOException("无法确认崩溃前创建的目标记录，恢复日志已保留")
