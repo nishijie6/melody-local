@@ -86,7 +86,7 @@ class VideoAudioImportWorkerTest {
     }
 
     @After
-    fun tearDown() = runBlocking {
+    fun tearDown(): Unit = runBlocking {
         val metadata = RoomSongMetadataStore(PlaylistDatabase.getInstance(context).songStateDao())
         publishedUris.forEach { runCatching { context.contentResolver.delete(it, null, null) } }
         val overrides = metadata.getAll()
@@ -103,7 +103,7 @@ class VideoAudioImportWorkerTest {
     }
 
     @Test
-    fun transformerCreatesAudioOnlyM4aAndStoresFirstFrameArtwork() = runBlocking {
+    fun transformerCreatesAudioOnlyM4aAndStoresFirstFrameArtwork(): Unit = runBlocking {
         val source = copyAsset("video_with_aac.mp4")
         val result = buildWorker(source, "Instrumentation video", extractArtwork = true).doWork()
 
@@ -147,7 +147,7 @@ class VideoAudioImportWorkerTest {
     }
 
     @Test
-    fun opusAudioIsTranscodedToAacAndReportsConversionProcess() = runBlocking {
+    fun opusAudioIsTranscodedToAacAndReportsConversionProcess(): Unit = runBlocking {
         val source = copyAsset("video_with_opus_short.webm")
         val result = buildWorker(source, "Opus transcode", extractArtwork = false).doWork()
 
@@ -185,7 +185,7 @@ class VideoAudioImportWorkerTest {
     }
 
     @Test
-    fun unavailableVideoFrameKeepsMetadataWithoutCreatingPrivateArtwork() = runBlocking {
+    fun unavailableVideoFrameKeepsMetadataWithoutCreatingPrivateArtwork(): Unit = runBlocking {
         // A real audio-only MP4 exercises MediaMetadataRetriever's no-frame result while keeping
         // the export path valid. The UI then uses its normal gradient/music-note placeholder.
         val source = copyAsset("audio_only_aac.m4a")
@@ -209,7 +209,7 @@ class VideoAudioImportWorkerTest {
     }
 
     @Test
-    fun videoWithoutAudioFailsWithoutPublishingAnOutput() = runBlocking {
+    fun videoWithoutAudioFailsWithoutPublishingAnOutput(): Unit = runBlocking {
         val source = copyAsset("video_without_audio.mp4")
         val result = buildWorker(source, "No audio", extractArtwork = false).doWork()
 
@@ -224,7 +224,7 @@ class VideoAudioImportWorkerTest {
     }
 
     @Test
-    fun cancellationStopsTransformerAndLeavesNoPublishedOrTemporaryAudio() = runBlocking {
+    fun cancellationStopsTransformerAndLeavesNoPublishedOrTemporaryAudio(): Unit = runBlocking {
         val source = copyAsset("video_with_opus.webm")
         val worker = buildWorker(source, "Cancellation fixture", extractArtwork = false)
         val task = async(Dispatchers.Default) { worker.doWork() }
@@ -251,7 +251,7 @@ class VideoAudioImportWorkerTest {
     }
 
     @Test
-    fun publishedArtifactCleanupFinishesFromACancelledCoroutine() = runBlocking {
+    fun publishedArtifactCleanupFinishesFromACancelledCoroutine(): Unit = runBlocking {
         val songId = Long.MAX_VALUE - (System.nanoTime() and 0xFFFFF)
         val workId = UUID.randomUUID()
         val artwork = File(context.filesDir, "artwork/$songId-video-$workId.jpg")
@@ -328,7 +328,7 @@ class VideoAudioImportWorkerTest {
     }
 
     @Test
-    fun completedPublicationIsReusedByTheSameWorkerIdWithoutASecondExport() = runBlocking {
+    fun completedPublicationIsReusedByTheSameWorkerIdWithoutASecondExport(): Unit = runBlocking {
         val source = copyAsset("video_with_aac.mp4")
         val workId = UUID.randomUUID()
         val title = "Idempotent ${workId.toString().take(8)}"
@@ -397,7 +397,7 @@ class VideoAudioImportWorkerTest {
     }
 
     @Test
-    fun revokedDisplayNameQueryReturnsAnExplicitFailure() = runBlocking {
+    fun revokedDisplayNameQueryReturnsAnExplicitFailure(): Unit = runBlocking {
         val source = File(context.cacheDir, "revoked-${System.nanoTime()}.mp4").apply {
             writeBytes(byteArrayOf(1, 2, 3))
         }
@@ -434,7 +434,7 @@ class VideoAudioImportWorkerTest {
     }
 
     @Test
-    fun videoCleanupDoesNotDeletePlaylistRelocationPendingRows() = runBlocking {
+    fun videoCleanupDoesNotDeletePlaylistRelocationPendingRows(): Unit = runBlocking {
         assumeTrue(Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
         val collection = MediaStore.Audio.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
         val relativePath = "${Environment.DIRECTORY_MUSIC}/音澜/视频提取/"
@@ -475,7 +475,7 @@ class VideoAudioImportWorkerTest {
     }
 
     @Test
-    fun legacyNoReplaceAndRecoveryNeverDeletesARacingTarget() = runBlocking {
+    fun legacyNoReplaceAndRecoveryNeverDeletesARacingTarget(): Unit = runBlocking {
         assumeTrue(Build.VERSION.SDK_INT <= Build.VERSION_CODES.P)
         @Suppress("DEPRECATION")
         val directory = File(
@@ -525,7 +525,7 @@ class VideoAudioImportWorkerTest {
     }
 
     @Test
-    fun legacyConditionalDeleteFailurePreservesRowFileAndJournal() = runBlocking {
+    fun legacyConditionalDeleteFailurePreservesRowFileAndJournal(): Unit = runBlocking {
         assumeTrue(Build.VERSION.SDK_INT <= Build.VERSION_CODES.P)
         @Suppress("DEPRECATION")
         val directory = File(
@@ -615,7 +615,7 @@ class VideoAudioImportWorkerTest {
     }
 
     @Test
-    fun legacyCancellationWaitsForDelayedScannerAndLeavesNoLateOrphan() = runBlocking {
+    fun legacyCancellationWaitsForDelayedScannerAndLeavesNoLateOrphan(): Unit = runBlocking {
         assumeTrue(Build.VERSION.SDK_INT <= Build.VERSION_CODES.P)
         val source = copyAsset("video_with_aac.mp4")
         val scanRequest = CompletableDeferred<Pair<File, (Uri?) -> Unit>>()
@@ -689,7 +689,7 @@ class VideoAudioImportWorkerTest {
     }
 
     @Test
-    fun legacyTargetReadyRestartRescansBeforeDeletingTheDurableTarget() = runBlocking {
+    fun legacyTargetReadyRestartRescansBeforeDeletingTheDurableTarget(): Unit = runBlocking {
         assumeTrue(Build.VERSION.SDK_INT <= Build.VERSION_CODES.P)
         @Suppress("DEPRECATION")
         val directory = File(
@@ -779,7 +779,7 @@ class VideoAudioImportWorkerTest {
     }
 
     @Test
-    fun legacyCancelledScanTimesOutThenLateCallbackRemainsRecoverable() = runBlocking {
+    fun legacyCancelledScanTimesOutThenLateCallbackRemainsRecoverable(): Unit = runBlocking {
         assumeTrue(Build.VERSION.SDK_INT <= Build.VERSION_CODES.P)
         val source = copyAsset("video_with_aac.mp4")
         val scanRequest = CompletableDeferred<Pair<File, (Uri?) -> Unit>>()
@@ -874,7 +874,7 @@ class VideoAudioImportWorkerTest {
     }
 
     @Test
-    fun legacyFinalizeRefusesScannerUriWhoseDataPathChanged() = runBlocking {
+    fun legacyFinalizeRefusesScannerUriWhoseDataPathChanged(): Unit = runBlocking {
         assumeTrue(Build.VERSION.SDK_INT <= Build.VERSION_CODES.P)
         val source = copyAsset("video_with_aac.mp4")
         val workId = UUID.randomUUID()
@@ -968,7 +968,7 @@ class VideoAudioImportWorkerTest {
     }
 
     @Test
-    fun publishedReceiptCommitFailureFailsForwardAndNextWorkerAdoptsOutput() = runBlocking {
+    fun publishedReceiptCommitFailureFailsForwardAndNextWorkerAdoptsOutput(): Unit = runBlocking {
         val source = copyAsset("video_with_aac.mp4")
         val firstWorkId = UUID.randomUUID()
         val secondWorkId = UUID.randomUUID()
@@ -1048,7 +1048,7 @@ class VideoAudioImportWorkerTest {
     }
 
     @Test
-    fun cancellationAfterPreparedPublishesOnceAndRetryAdoptsTheVerifiedReceipt() = runBlocking {
+    fun cancellationAfterPreparedPublishesOnceAndRetryAdoptsTheVerifiedReceipt(): Unit = runBlocking {
         val source = copyAsset("video_with_aac.mp4")
         val firstWorkId = UUID.randomUUID()
         val interveningWorkId = UUID.randomUUID()
@@ -1173,7 +1173,7 @@ class VideoAudioImportWorkerTest {
     }
 
     @Test
-    fun failedPendingDeleteKeepsMediaMetadataArtworkAndReceipt() = runBlocking {
+    fun failedPendingDeleteKeepsMediaMetadataArtworkAndReceipt(): Unit = runBlocking {
         assumeTrue(Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
         val workId = UUID.randomUUID()
         val collection = MediaStore.Audio.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
@@ -1265,7 +1265,7 @@ class VideoAudioImportWorkerTest {
     }
 
     @Test
-    fun pendingCleanupCannotDeleteARowPublishedAfterItsQuery() = runBlocking {
+    fun pendingCleanupCannotDeleteARowPublishedAfterItsQuery(): Unit = runBlocking {
         assumeTrue(Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
         val workId = UUID.randomUUID()
         val collection = MediaStore.Audio.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
@@ -1392,7 +1392,7 @@ class VideoAudioImportWorkerTest {
     }
 
     @Test
-    fun shortModernMediaStoreWriteFailsAndRemovesThePendingRow() = runBlocking {
+    fun shortModernMediaStoreWriteFailsAndRemovesThePendingRow(): Unit = runBlocking {
         assumeTrue(Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
         val source = copyAsset("video_with_aac.mp4")
         var shortWriteUri: Uri? = null
@@ -1441,7 +1441,7 @@ class VideoAudioImportWorkerTest {
     }
 
     @Test
-    fun secondaryVolumeIdCollisionRemovesOnlyTheNewPendingRow() = runBlocking {
+    fun secondaryVolumeIdCollisionRemovesOnlyTheNewPendingRow(): Unit = runBlocking {
         assumeTrue(Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
         assertModernVolumeLookupFailurePreservesExistingMetadata(
             secondaryLookup = VideoSongIdLookup.PRESENT,
@@ -1450,7 +1450,7 @@ class VideoAudioImportWorkerTest {
     }
 
     @Test
-    fun inaccessibleSecondaryVolumeRemovesOnlyTheNewPendingRow() = runBlocking {
+    fun inaccessibleSecondaryVolumeRemovesOnlyTheNewPendingRow(): Unit = runBlocking {
         assumeTrue(Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
         assertModernVolumeLookupFailurePreservesExistingMetadata(
             secondaryLookup = VideoSongIdLookup.INACCESSIBLE,
@@ -1459,7 +1459,7 @@ class VideoAudioImportWorkerTest {
     }
 
     @Test
-    fun cancellationAfterModernInsertImmediatelyCleansTheAllocatedRow() = runBlocking {
+    fun cancellationAfterModernInsertImmediatelyCleansTheAllocatedRow(): Unit = runBlocking {
         assumeTrue(Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
         val source = copyAsset("video_with_aac.mp4")
         val copyStarted = CompletableDeferred<Uri>()
@@ -1512,7 +1512,7 @@ class VideoAudioImportWorkerTest {
     }
 
     @Test
-    fun completedReceiptRejectsATruncatedOutputBeforeReplay() = runBlocking {
+    fun completedReceiptRejectsATruncatedOutputBeforeReplay(): Unit = runBlocking {
         val source = copyAsset("video_with_aac.mp4")
         val workId = UUID.randomUUID()
         val title = "Receipt integrity ${workId.toString().take(8)}"
@@ -1562,7 +1562,7 @@ class VideoAudioImportWorkerTest {
     }
 
     @Test
-    fun metadataIntentRestoresPreviousOverrideWhenDaoCommitPrecedesFailure() = runBlocking {
+    fun metadataIntentRestoresPreviousOverrideWhenDaoCommitPrecedesFailure(): Unit = runBlocking {
         val source = copyAsset("video_with_aac.mp4")
         val workId = UUID.randomUUID()
         val metadata = RoomSongMetadataStore(PlaylistDatabase.getInstance(context).songStateDao())
@@ -1632,7 +1632,7 @@ class VideoAudioImportWorkerTest {
     }
 
     @Test
-    fun allocatedPendingReceiptIsFullyRecoveredBeforeTheNextImport() = runBlocking {
+    fun allocatedPendingReceiptIsFullyRecoveredBeforeTheNextImport(): Unit = runBlocking {
         assumeTrue(Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
         val interruptedWorkId = UUID.randomUUID()
         val collection = MediaStore.Audio.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)

@@ -1229,7 +1229,7 @@ class MediaStoreSongRelocationCoordinator(
             SourceAvailability.PRESENT -> if (!destinationVerified) {
                 retainDestinationForSafety(
                     item,
-                    "原歌曲仍存在，但已复制的目标无法通过校验；未请求删除授权",
+                    "原歌曲仍存在，但已复制的目标无法通过校验；未请求删除授权，恢复信息已保留",
                 )
             }
             SourceAvailability.MISSING -> if (destinationVerified) {
@@ -2258,27 +2258,43 @@ class MediaStoreSongRelocationCoordinator(
         ) {
             return false
         }
-        val clauses = mutableListOf("${MediaStore.Audio.Media.IS_PENDING} = 1")
-        val arguments = mutableListOf<String>()
-        if (requireDisplayName) {
-            clauses += "${MediaStore.Audio.Media.DISPLAY_NAME} = ?"
-            arguments += item.displayName
-        }
-        expectedRelativePath?.let { path ->
-            clauses += "${MediaStore.Audio.Media.RELATIVE_PATH} = ?"
-            arguments += path
-        }
-        if (requireRecoveryMarker) {
-            clauses += "${MediaStore.Audio.Media.TITLE} = ?"
-            arguments += pendingMoveDestinationMarker(item.operationId, item.oldSongId)
-        }
-        val deleted = runCatching {
-            resolver.delete(
+        val rowMatches = try {
+            resolver.query(
                 uri,
-                clauses.joinToString(" AND "),
-                arguments.toTypedArray(),
-            )
-        }.getOrElse { return false }
+                arrayOf(
+                    MediaStore.Audio.Media._ID,
+                    MediaStore.Audio.Media.IS_PENDING,
+                    MediaStore.Audio.Media.DISPLAY_NAME,
+                    MediaStore.Audio.Media.RELATIVE_PATH,
+                    MediaStore.Audio.Media.TITLE,
+                ),
+                null,
+                null,
+                null,
+            )?.use { cursor ->
+                if (!cursor.moveToFirst()) return true
+                cursor.getLong(0) == item.newSongId &&
+                    cursor.getInt(1) == 1 &&
+                    (!requireDisplayName ||
+                        cursor.getString(2).equals(item.displayName, ignoreCase = true)) &&
+                    (expectedRelativePath == null ||
+                        cursor.getString(3).equals(expectedRelativePath, ignoreCase = true)) &&
+                    (!requireRecoveryMarker ||
+                        cursor.getString(4) == pendingMoveDestinationMarker(
+                            item.operationId,
+                            item.oldSongId,
+                        )) &&
+                    !cursor.moveToNext()
+            } ?: return false
+        } catch (_: Throwable) {
+            return false
+        }
+        if (!rowMatches) return false
+
+        // The exact app-created IS_PENDING row is private to this app. Some MediaStore versions
+        // reject or ignore predicates on an item-URI delete, so validate every ownership field
+        // first and then delete that concrete URI without a provider-specific selection clause.
+        val deleted = runCatching { resolver.delete(uri, null, null) }.getOrElse { return false }
         return when (deleted) {
             1 -> true
             0 -> sourceAvailability(uri) == SourceAvailability.MISSING

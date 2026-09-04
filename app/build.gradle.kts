@@ -73,6 +73,10 @@ android {
     }
     lint {
         warningsAsErrors = true
+        // Release dependencies are deliberately pinned and upgraded as a tested set. A newer
+        // artifact appearing in Google's repository must not make an otherwise reproducible
+        // Release fail overnight; security/correctness lint checks remain warnings-as-errors.
+        disable += "GradleDependency"
     }
 }
 

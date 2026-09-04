@@ -1483,8 +1483,16 @@ class SongRelocationCoordinatorInstrumentedTest {
         assertTrue((step as RelocationStep.Finished).state is MediaOperationState.Failed)
         val finalItem = waiting.journal.items(waiting.operationId).single()
         assertEquals(MoveItemStatus.FAILED, finalItem.status)
-        assertEquals(waiting.destinationUri.toString(), finalItem.destinationUri)
-        assertTrue(finalItem.checksum != null)
+        assertNull(finalItem.destinationUri)
+        assertNull(finalItem.checksum)
+        val destinationStillExists = context.contentResolver.query(
+            waiting.destinationUri,
+            arrayOf(MediaStore.Audio.Media._ID),
+            null,
+            null,
+            null,
+        )?.use { it.moveToFirst() } == true
+        assertFalse(destinationStillExists)
         assertArrayEquals(
             waiting.bytes,
             requireNotNull(context.contentResolver.openInputStream(waiting.sourceUri)).use {
