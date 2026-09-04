@@ -229,6 +229,10 @@ class MainViewModel internal constructor(
     init {
         viewModelScope.launch {
             playback.map { it.mediaId }.distinctUntilChanged().collect { songId ->
+                // A StateFlow update can overtake a collector that was just resumed for the
+                // previous song. Never let that stale callback cancel search/editor work that
+                // already belongs to the latest playback item.
+                if (songId != playback.value.mediaId) return@collect
                 lyricsSearchRequestId++
                 lyricsSearchJob?.cancel()
                 lyricsSearchJob = null

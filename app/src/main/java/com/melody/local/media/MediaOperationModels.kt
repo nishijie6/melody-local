@@ -170,6 +170,13 @@ internal fun pendingMoveDestinationMarker(operationId: String, oldSongId: Long):
 internal fun pendingMoveDestinationDisplayName(operationId: String, oldSongId: Long): String =
     "yinlan-pending-move-$operationId-$oldSongId"
 
+internal fun pendingMoveDestinationRelativePath(
+    targetRelativePath: String,
+    operationId: String,
+    oldSongId: Long,
+): String = targetRelativePath.trimEnd('/') +
+    "/.yinlan-pending-move-$operationId-$oldSongId/"
+
 internal fun isSyntheticExternalMediaUri(uri: String): Boolean =
     SYNTHETIC_EXTERNAL_MEDIA_URI.matches(uri.substringBefore('?'))
 

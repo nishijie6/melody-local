@@ -625,7 +625,14 @@ class SongRelocationCoordinatorInstrumentedTest {
                         pendingMoveDestinationMarker(operation.id, sourceId),
                     )
                     put(MediaStore.Audio.Media.MIME_TYPE, "audio/wav")
-                    put(MediaStore.Audio.Media.RELATIVE_PATH, operation.targetRelativePath)
+                    put(
+                        MediaStore.Audio.Media.RELATIVE_PATH,
+                        pendingMoveDestinationRelativePath(
+                            operation.targetRelativePath,
+                            operation.id,
+                            sourceId,
+                        ),
+                    )
                     put(MediaStore.Audio.Media.IS_PENDING, 1)
                 },
             )

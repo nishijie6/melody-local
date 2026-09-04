@@ -170,6 +170,14 @@ class MediaOperationRulesTest {
             pendingMoveDestinationDisplayName("operation-7", 42L) ==
                 pendingMoveDestinationDisplayName("operation-7", 43L)
         )
+        assertEquals(
+            "Music/音澜/歌单汇总/.yinlan-pending-move-operation-7-42/",
+            pendingMoveDestinationRelativePath(
+                "Music/音澜/歌单汇总/",
+                "operation-7",
+                42L,
+            ),
+        )
     }
 
     @Test
