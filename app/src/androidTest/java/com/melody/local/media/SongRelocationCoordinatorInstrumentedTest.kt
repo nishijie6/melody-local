@@ -588,6 +588,7 @@ class SongRelocationCoordinatorInstrumentedTest {
     }
 
     @Test
+    @Suppress("DEPRECATION")
     fun recoveryDeletesOperationMarkedPendingRowCreatedBeforeUriWasJournaled() = runBlocking {
         assumeTrue(Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
         val token = UUID.randomUUID().toString().take(8)
@@ -618,7 +619,7 @@ class SongRelocationCoordinatorInstrumentedTest {
                 ContentValues().apply {
                     put(
                         MediaStore.Audio.Media.DISPLAY_NAME,
-                        pendingMoveDestinationDisplayName(operation.id, sourceId),
+                        item.displayName,
                     )
                     put(
                         MediaStore.Audio.Media.TITLE,
@@ -652,14 +653,25 @@ class SongRelocationCoordinatorInstrumentedTest {
         }
 
         assertTrue(recovered is RelocationStep.Finished)
-        val orphanStillExists = context.contentResolver.query(
-            orphan,
-            arrayOf(MediaStore.Audio.Media._ID),
+        val orphanOwnershipStillExists = context.contentResolver.query(
+            MediaStore.setIncludePending(orphan),
+            arrayOf(
+                MediaStore.Audio.Media.IS_PENDING,
+                MediaStore.Audio.Media.RELATIVE_PATH,
+            ),
             null,
             null,
             null,
-        )?.use { it.moveToFirst() } == true
-        assertEquals(false, orphanStillExists)
+        )?.use { cursor ->
+            cursor.moveToFirst() &&
+                cursor.getInt(0) == 1 &&
+                cursor.getString(1) == pendingMoveDestinationRelativePath(
+                    operation.targetRelativePath,
+                    operation.id,
+                    sourceId,
+                )
+        } == true
+        assertEquals(false, orphanOwnershipStillExists)
     }
 
     @Test

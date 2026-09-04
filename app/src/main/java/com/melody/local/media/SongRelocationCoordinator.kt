@@ -739,10 +739,6 @@ class MediaStoreSongRelocationCoordinator(
         val source = querySource(item) ?: throw IOException("歌曲文件已丢失")
         val targetCollection = MediaStore.Audio.Media.getContentUri(PRIMARY_EXTERNAL_MEDIA_VOLUME)
         val recoveryMarker = pendingMoveDestinationMarker(item.operationId, item.oldSongId)
-        val recoveryDisplayName = pendingMoveDestinationDisplayName(
-            item.operationId,
-            item.oldSongId,
-        )
         val recoveryRelativePath = pendingMoveDestinationRelativePath(
             operation.targetRelativePath,
             item.operationId,
@@ -751,7 +747,7 @@ class MediaStoreSongRelocationCoordinator(
         val destination = resolver.insert(
             targetCollection,
             ContentValues().apply {
-                put(MediaStore.Audio.Media.DISPLAY_NAME, recoveryDisplayName)
+                put(MediaStore.Audio.Media.DISPLAY_NAME, item.displayName)
                 // This deterministic, operation-scoped marker closes the otherwise unavoidable
                 // crash window between MediaStore.insert() and persisting the returned Uri.
                 put(MediaStore.Audio.Media.TITLE, recoveryMarker)
@@ -839,7 +835,6 @@ class MediaStoreSongRelocationCoordinator(
         val metadataUpdated = resolver.update(
             destination,
             ContentValues().apply {
-                put(MediaStore.Audio.Media.DISPLAY_NAME, item.displayName)
                 put(MediaStore.Audio.Media.TITLE, source.title)
                 put(MediaStore.Audio.Media.RELATIVE_PATH, operation.targetRelativePath)
             },
@@ -877,8 +872,7 @@ class MediaStoreSongRelocationCoordinator(
             MediaStore.MediaColumns.VOLUME_NAME,
         )
         return runCatching {
-            @Suppress("DEPRECATION")
-            val queryUri = MediaStore.setIncludePending(destination)
+            val queryUri = includePendingMedia(destination)
             val cursor = mediaAccess.query(resolver, queryUri, projection) ?: return false
             cursor.use {
                 if (!it.moveToFirst()) return false
@@ -888,6 +882,12 @@ class MediaStoreSongRelocationCoordinator(
                     it.getColumnIndex(column).takeIf { index -> index >= 0 }?.let(it::getLong) ?: -1L
                 val title = string(MediaStore.Audio.Media.TITLE)
                 val displayName = string(MediaStore.Audio.Media.DISPLAY_NAME)
+                val relativePath = string(MediaStore.Audio.Media.RELATIVE_PATH)
+                val recoveryRelativePath = pendingMoveDestinationRelativePath(
+                    operation.targetRelativePath,
+                    item.operationId,
+                    item.oldSongId,
+                )
                 long(MediaStore.Audio.Media._ID) == item.newSongId &&
                     long(MediaStore.Audio.Media.IS_PENDING) == 1L &&
                     (displayName.equals(item.displayName, ignoreCase = true) ||
@@ -897,20 +897,13 @@ class MediaStoreSongRelocationCoordinator(
                                 item.oldSongId,
                             ),
                         ) == true) &&
-                    (string(MediaStore.Audio.Media.RELATIVE_PATH)
-                        .equals(operation.targetRelativePath, ignoreCase = true) ||
-                        string(MediaStore.Audio.Media.RELATIVE_PATH).equals(
-                            pendingMoveDestinationRelativePath(
-                                operation.targetRelativePath,
-                                item.operationId,
-                                item.oldSongId,
-                            ),
-                            ignoreCase = true,
-                        )) &&
+                    (relativePath.equals(operation.targetRelativePath, ignoreCase = true) ||
+                        relativePath.equals(recoveryRelativePath, ignoreCase = true)) &&
                     string(MediaStore.MediaColumns.VOLUME_NAME)
                         .equals(PRIMARY_EXTERNAL_MEDIA_VOLUME, ignoreCase = true) &&
                     (title == pendingMoveDestinationMarker(item.operationId, item.oldSongId) ||
                         title == source.title ||
+                        relativePath.equals(recoveryRelativePath, ignoreCase = true) ||
                         displayName?.startsWith(
                             pendingMoveDestinationDisplayName(
                                 item.operationId,
@@ -1919,6 +1912,14 @@ class MediaStoreSongRelocationCoordinator(
     private fun sourceAvailability(item: MoveItemRecord): SourceAvailability =
         concreteSourceUriOrNull(item)?.let(::sourceAvailability) ?: SourceAvailability.INACCESSIBLE
 
+    @Suppress("DEPRECATION")
+    private fun includePendingMedia(uri: Uri): Uri =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            MediaStore.setIncludePending(uri)
+        } else {
+            uri
+        }
+
     private fun sourceAvailability(uri: Uri): SourceAvailability {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
             isSyntheticExternalMediaUri(uri.toString())
@@ -2295,8 +2296,7 @@ class MediaStoreSongRelocationCoordinator(
             return false
         }
         val rowMatches = try {
-            @Suppress("DEPRECATION")
-            val queryUri = MediaStore.setIncludePending(uri)
+            val queryUri = includePendingMedia(uri)
             resolver.query(
                 queryUri,
                 arrayOf(
@@ -2450,8 +2450,7 @@ class MediaStoreSongRelocationCoordinator(
             item.operationId,
             item.oldSongId,
         )
-        @Suppress("DEPRECATION")
-        val pendingCollection = MediaStore.setIncludePending(collection)
+        val pendingCollection = includePendingMedia(collection)
         val cursor = resolver.query(
             pendingCollection,
             arrayOf(MediaStore.Audio.Media._ID),
