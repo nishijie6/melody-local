@@ -616,7 +616,10 @@ class SongRelocationCoordinatorInstrumentedTest {
             context.contentResolver.insert(
                 collection,
                 ContentValues().apply {
-                    put(MediaStore.Audio.Media.DISPLAY_NAME, "orphan-$token.wav")
+                    put(
+                        MediaStore.Audio.Media.DISPLAY_NAME,
+                        pendingMoveDestinationDisplayName(operation.id, sourceId),
+                    )
                     put(
                         MediaStore.Audio.Media.TITLE,
                         pendingMoveDestinationMarker(operation.id, sourceId),
@@ -1480,7 +1483,8 @@ class SongRelocationCoordinatorInstrumentedTest {
         val step = waiting.coordinator.resume(authorizationGranted = true) {}
 
         assertTrue(step is RelocationStep.Finished)
-        assertTrue((step as RelocationStep.Finished).state is MediaOperationState.Failed)
+        val completed = (step as RelocationStep.Finished).state as MediaOperationState.Completed
+        assertEquals(1, completed.summary.failed)
         val finalItem = waiting.journal.items(waiting.operationId).single()
         assertEquals(MoveItemStatus.FAILED, finalItem.status)
         assertNull(finalItem.destinationUri)

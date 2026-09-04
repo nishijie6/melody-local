@@ -162,6 +162,14 @@ class MediaOperationRulesTest {
             pendingMoveDestinationMarker("operation-7", 42L) ==
                 pendingMoveDestinationMarker("operation-7", 43L)
         )
+        assertEquals(
+            "yinlan-pending-move-operation-7-42.tmp",
+            pendingMoveDestinationDisplayName("operation-7", 42L),
+        )
+        assertFalse(
+            pendingMoveDestinationDisplayName("operation-7", 42L) ==
+                pendingMoveDestinationDisplayName("operation-7", 43L)
+        )
     }
 
     @Test

@@ -739,10 +739,14 @@ class MediaStoreSongRelocationCoordinator(
         val source = querySource(item) ?: throw IOException("歌曲文件已丢失")
         val targetCollection = MediaStore.Audio.Media.getContentUri(PRIMARY_EXTERNAL_MEDIA_VOLUME)
         val recoveryMarker = pendingMoveDestinationMarker(item.operationId, item.oldSongId)
+        val recoveryDisplayName = pendingMoveDestinationDisplayName(
+            item.operationId,
+            item.oldSongId,
+        )
         val destination = resolver.insert(
             targetCollection,
             ContentValues().apply {
-                put(MediaStore.Audio.Media.DISPLAY_NAME, item.displayName)
+                put(MediaStore.Audio.Media.DISPLAY_NAME, recoveryDisplayName)
                 // This deterministic, operation-scoped marker closes the otherwise unavoidable
                 // crash window between MediaStore.insert() and persisting the returned Uri.
                 put(MediaStore.Audio.Media.TITLE, recoveryMarker)
@@ -828,7 +832,10 @@ class MediaStoreSongRelocationCoordinator(
         }
         val metadataUpdated = resolver.update(
             destination,
-            ContentValues().apply { put(MediaStore.Audio.Media.TITLE, source.title) },
+            ContentValues().apply {
+                put(MediaStore.Audio.Media.DISPLAY_NAME, item.displayName)
+                put(MediaStore.Audio.Media.TITLE, source.title)
+            },
             null,
             null,
         )
@@ -871,16 +878,24 @@ class MediaStoreSongRelocationCoordinator(
                 fun long(column: String): Long =
                     it.getColumnIndex(column).takeIf { index -> index >= 0 }?.let(it::getLong) ?: -1L
                 val title = string(MediaStore.Audio.Media.TITLE)
+                val displayName = string(MediaStore.Audio.Media.DISPLAY_NAME)
                 long(MediaStore.Audio.Media._ID) == item.newSongId &&
                     long(MediaStore.Audio.Media.IS_PENDING) == 1L &&
-                    string(MediaStore.Audio.Media.DISPLAY_NAME)
-                        .equals(item.displayName, ignoreCase = true) &&
+                    (displayName.equals(item.displayName, ignoreCase = true) ||
+                        displayName == pendingMoveDestinationDisplayName(
+                            item.operationId,
+                            item.oldSongId,
+                        )) &&
                     string(MediaStore.Audio.Media.RELATIVE_PATH)
                         .equals(operation.targetRelativePath, ignoreCase = true) &&
                     string(MediaStore.MediaColumns.VOLUME_NAME)
                         .equals(PRIMARY_EXTERNAL_MEDIA_VOLUME, ignoreCase = true) &&
                     (title == pendingMoveDestinationMarker(item.operationId, item.oldSongId) ||
-                        title == source.title)
+                        title == source.title ||
+                        displayName == pendingMoveDestinationDisplayName(
+                            item.operationId,
+                            item.oldSongId,
+                        ))
             }
         }.getOrDefault(false)
     }
@@ -2273,14 +2288,22 @@ class MediaStoreSongRelocationCoordinator(
                 null,
             )?.use { cursor ->
                 if (!cursor.moveToFirst()) return true
+                val displayName = cursor.getString(2)
                 cursor.getLong(0) == item.newSongId &&
                     cursor.getInt(1) == 1 &&
                     (!requireDisplayName ||
-                        cursor.getString(2).equals(item.displayName, ignoreCase = true)) &&
+                        displayName.equals(item.displayName, ignoreCase = true) ||
+                        displayName == pendingMoveDestinationDisplayName(
+                            item.operationId,
+                            item.oldSongId,
+                        )) &&
                     (expectedRelativePath == null ||
                         cursor.getString(3).equals(expectedRelativePath, ignoreCase = true)) &&
                     (!requireRecoveryMarker ||
-                        cursor.getString(4) == pendingMoveDestinationMarker(
+                        displayName == pendingMoveDestinationDisplayName(
+                            item.operationId,
+                            item.oldSongId,
+                        ) || cursor.getString(4) == pendingMoveDestinationMarker(
                             item.operationId,
                             item.oldSongId,
                         )) &&
@@ -2386,10 +2409,13 @@ class MediaStoreSongRelocationCoordinator(
             collection,
             arrayOf(MediaStore.Audio.Media._ID),
             "${MediaStore.Audio.Media.RELATIVE_PATH} = ? AND " +
-                "${MediaStore.Audio.Media.TITLE} = ? AND ${MediaStore.Audio.Media.IS_PENDING} = 1",
+                "(${MediaStore.Audio.Media.TITLE} = ? OR " +
+                "${MediaStore.Audio.Media.DISPLAY_NAME} = ?) AND " +
+                "${MediaStore.Audio.Media.IS_PENDING} = 1",
             arrayOf(
                 operation.targetRelativePath,
                 pendingMoveDestinationMarker(item.operationId, item.oldSongId),
+                pendingMoveDestinationDisplayName(item.operationId, item.oldSongId),
             ),
             null,
         ) ?: throw IOException("无法确认崩溃前创建的目标记录，恢复日志已保留")

@@ -733,6 +733,7 @@ open class VideoAudioImportWorker(
             val exportStrategy = audioExportStrategy(audioMime)
             updateProgress(2, displayName)
             tempOutput.delete()
+            beforeAudioExport()
             val audioConversionProcess = exportAudio(
                 sourceUri = sourceUri,
                 output = tempOutput,
@@ -916,6 +917,9 @@ open class VideoAudioImportWorker(
 
     /** Test seam for the PREPARED -> public transition; production returns immediately. */
     protected open suspend fun beforeFinalizePublishedAudio() = Unit
+
+    /** Test seam for deterministic cancellation before Transformer owns an output file. */
+    protected open suspend fun beforeAudioExport() = Unit
 
     /** Test seams around the durable metadata-intent/DAO-commit boundary. */
     protected open suspend fun beforeMetadataOwnershipIntent(songId: Long) = Unit

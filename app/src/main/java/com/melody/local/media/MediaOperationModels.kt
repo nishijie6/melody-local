@@ -162,6 +162,14 @@ internal fun legacyPreparedRecoveryAction(
 internal fun pendingMoveDestinationMarker(operationId: String, oldSongId: Long): String =
     "yinlan-pending-move:$operationId:$oldSongId"
 
+/**
+ * MediaProvider may derive TITLE from DISPLAY_NAME while inserting a pending item. Keep the
+ * crash-recovery identity in the unpublished file name as well, then replace it with the user's
+ * final name only after the audio bytes have been verified.
+ */
+internal fun pendingMoveDestinationDisplayName(operationId: String, oldSongId: Long): String =
+    "yinlan-pending-move-$operationId-$oldSongId.tmp"
+
 internal fun isSyntheticExternalMediaUri(uri: String): Boolean =
     SYNTHETIC_EXTERNAL_MEDIA_URI.matches(uri.substringBefore('?'))
 
