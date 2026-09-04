@@ -738,7 +738,6 @@ class MediaStoreSongRelocationCoordinator(
     ) {
         val source = querySource(item) ?: throw IOException("歌曲文件已丢失")
         val targetCollection = MediaStore.Audio.Media.getContentUri(PRIMARY_EXTERNAL_MEDIA_VOLUME)
-        val recoveryMarker = pendingMoveDestinationMarker(item.operationId, item.oldSongId)
         val recoveryRelativePath = pendingMoveDestinationRelativePath(
             operation.targetRelativePath,
             item.operationId,
@@ -750,7 +749,7 @@ class MediaStoreSongRelocationCoordinator(
                 put(MediaStore.Audio.Media.DISPLAY_NAME, item.displayName)
                 // This deterministic, operation-scoped marker closes the otherwise unavoidable
                 // crash window between MediaStore.insert() and persisting the returned Uri.
-                put(MediaStore.Audio.Media.TITLE, recoveryMarker)
+                put(MediaStore.Audio.Media.TITLE, source.title)
                 put(MediaStore.Audio.Media.ARTIST, source.artist)
                 put(MediaStore.Audio.Media.ALBUM, source.album)
                 put(MediaStore.Audio.Media.MIME_TYPE, source.mimeType)
@@ -771,7 +770,7 @@ class MediaStoreSongRelocationCoordinator(
             check(journaledPendingDestinationMatches(operation, preparedWithDestination, source)) {
                 "目标歌曲记录不再属于本次移动"
             }
-            writePendingDestination(operation, preparedWithDestination, source)
+            writePendingDestination(preparedWithDestination, source)
         } catch (error: Throwable) {
             if (!destinationWasJournaled) {
                 val cleanupFailure = runCatching { cleanupDestination(preparedWithDestination) }
@@ -804,11 +803,10 @@ class MediaStoreSongRelocationCoordinator(
         check(journaledPendingDestinationMatches(operation, item, source)) {
             "无法确认崩溃前的目标记录，原文件未删除"
         }
-        writePendingDestination(operation, item, source)
+        writePendingDestination(item, source)
     }
 
     private suspend fun writePendingDestination(
-        operation: MoveOperationRecord,
         item: MoveItemRecord,
         source: SongSource,
     ) {
@@ -832,16 +830,10 @@ class MediaStoreSongRelocationCoordinator(
         check(copyVerificationPassed(item.sourceSize, copiedBytes, sourceHash, destinationHash)) {
             "歌曲复制校验失败，原文件未删除"
         }
-        val metadataUpdated = resolver.update(
-            destination,
-            ContentValues().apply {
-                put(MediaStore.Audio.Media.TITLE, source.title)
-                put(MediaStore.Audio.Media.RELATIVE_PATH, operation.targetRelativePath)
-            },
-            null,
-            null,
-        )
-        check(metadataUpdated == 1) { "无法初始化目标歌曲记录" }
+        // Keep the verified copy inside its operation-scoped hidden recovery directory until the
+        // source has actually been deleted. Some MediaStore implementations reject an early
+        // RELATIVE_PATH move on a pending row. Finalize the path and publish atomically in
+        // commitRemap(), after SOURCE_DELETED is durable, so recovery can always find this row.
         journal.updateItem(
             item.copy(
                 status = MoveItemStatus.COPIED,
@@ -1027,14 +1019,25 @@ class MediaStoreSongRelocationCoordinator(
                 check(destinationMatchesJournal(resolvedItem, cancellationContext)) {
                     "目标歌曲文件不存在或校验失败，关联信息尚未提交"
                 }
+                val targetRelativePath = orderedPendingOperations()
+                    .firstOrNull { it.id == resolvedItem.operationId }
+                    ?.targetRelativePath
+                    ?: throw IOException("无法确定目标歌曲目录，关联信息尚未提交")
                 val published = resolver.update(
                     destination,
-                    ContentValues().apply { put(MediaStore.Audio.Media.IS_PENDING, 0) },
+                    ContentValues().apply {
+                        put(MediaStore.Audio.Media.RELATIVE_PATH, targetRelativePath)
+                        put(MediaStore.Audio.Media.DISPLAY_NAME, resolvedItem.displayName)
+                        put(MediaStore.Audio.Media.IS_PENDING, 0)
+                    },
                     null,
                     null,
                 )
                 check(mediaStorePublishSucceeded(published)) {
                     "系统未能发布目标歌曲，关联信息尚未提交"
+                }
+                check(modernPublishedDestinationMatches(resolvedItem, targetRelativePath)) {
+                    "目标歌曲发布后路径、名称或内容校验失败，关联信息尚未提交"
                 }
             }
         }
@@ -2335,10 +2338,10 @@ class MediaStoreSongRelocationCoordinator(
                         ) == true) &&
                     (expectedRelativePath == null ||
                         relativePath.equals(expectedRelativePath, ignoreCase = true) ||
-                        (requireRecoveryMarker && relativePath.equals(
+                        relativePath.equals(
                             recoveryRelativePath,
                             ignoreCase = true,
-                        ))) &&
+                        )) &&
                     (!requireRecoveryMarker ||
                         relativePath.equals(recoveryRelativePath, ignoreCase = true) ||
                         displayName?.startsWith(
@@ -2418,20 +2421,30 @@ class MediaStoreSongRelocationCoordinator(
         ) {
             return false
         }
+        val recoveryRelativePath = pendingMoveDestinationRelativePath(
+            expectedRelativePath,
+            item.operationId,
+            item.oldSongId,
+        )
         val clauses = mutableListOf(
             "${MediaStore.Audio.Media.IS_PENDING} = 1",
             "${MediaStore.Audio.Media.DISPLAY_NAME} = ?",
-            "${MediaStore.Audio.Media.RELATIVE_PATH} = ?",
+            "(${MediaStore.Audio.Media.RELATIVE_PATH} = ? OR " +
+                "${MediaStore.Audio.Media.RELATIVE_PATH} = ?)",
         )
-        val arguments = mutableListOf(item.displayName, expectedRelativePath)
-        if (item.status == MoveItemStatus.PREPARED) {
-            clauses += "${MediaStore.Audio.Media.TITLE} = ?"
-            arguments += pendingMoveDestinationMarker(item.operationId, item.oldSongId)
-        }
+        val arguments = mutableListOf(
+            item.displayName,
+            expectedRelativePath,
+            recoveryRelativePath,
+        )
         val updated = runCatching {
             resolver.update(
                 uri,
-                ContentValues().apply { put(MediaStore.Audio.Media.IS_PENDING, 0) },
+                ContentValues().apply {
+                    put(MediaStore.Audio.Media.RELATIVE_PATH, expectedRelativePath)
+                    put(MediaStore.Audio.Media.DISPLAY_NAME, item.displayName)
+                    put(MediaStore.Audio.Media.IS_PENDING, 0)
+                },
                 clauses.joinToString(" AND "),
                 arguments.toTypedArray(),
             )
