@@ -1671,7 +1671,10 @@ class MediaStoreSongRelocationCoordinator(
             }
             DestinationCleanupOutcome.DESTINATION_RETAINED -> retainDestinationForSafety(
                 item,
-                "目标记录仍存在；为避免原歌曲并发消失或覆盖外部替换文件，未执行破坏性回滚，恢复信息已保留",
+                listOfNotNull(
+                    messageAfterCleanup,
+                    "目标记录仍存在；为避免原歌曲并发消失或覆盖外部替换文件，未执行破坏性回滚，恢复信息已保留",
+                ).joinToString("；"),
             )
         }
     }

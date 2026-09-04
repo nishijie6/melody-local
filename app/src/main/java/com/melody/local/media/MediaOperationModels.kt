@@ -162,11 +162,7 @@ internal fun legacyPreparedRecoveryAction(
 internal fun pendingMoveDestinationMarker(operationId: String, oldSongId: Long): String =
     "yinlan-pending-move:$operationId:$oldSongId"
 
-/**
- * MediaProvider may derive TITLE from DISPLAY_NAME while inserting a pending item. Keep the
- * crash-recovery identity in the unpublished file name as well, then replace it with the user's
- * final name only after the audio bytes have been verified.
- */
+/** MediaStore recovery identifiers are scoped to exactly one durable journal item. */
 internal fun pendingMoveDestinationDisplayName(operationId: String, oldSongId: Long): String =
     "yinlan-pending-move-$operationId-$oldSongId"
 
@@ -175,7 +171,10 @@ internal fun pendingMoveDestinationRelativePath(
     operationId: String,
     oldSongId: Long,
 ): String = targetRelativePath.trimEnd('/') +
-    "/.yinlan-pending-move-$operationId-$oldSongId/"
+    // Dot-prefixed directories can be inserted but cannot be opened for writing by some
+    // MediaProvider versions. IS_PENDING already keeps the row private, so use a regular,
+    // operation-scoped directory and move it to the final path only after source deletion.
+    "/yinlan-pending-move-$operationId-$oldSongId/"
 
 internal fun isSyntheticExternalMediaUri(uri: String): Boolean =
     SYNTHETIC_EXTERNAL_MEDIA_URI.matches(uri.substringBefore('?'))
