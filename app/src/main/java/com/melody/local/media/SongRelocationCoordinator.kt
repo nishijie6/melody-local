@@ -1508,9 +1508,12 @@ class MediaStoreSongRelocationCoordinator(
             deleteLegacyOwnershipMarker(item)
             return
         }
+        val targetRelativePath = orderedPendingOperations()
+            .firstOrNull { it.id == item.operationId }
+            ?.targetRelativePath
         if (!deleteModernPendingDestination(
                 item = item,
-                expectedRelativePath = null,
+                expectedRelativePath = targetRelativePath,
                 requireRecoveryMarker = true,
             )
         ) {

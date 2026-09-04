@@ -695,12 +695,13 @@ class SongRelocationCoordinatorInstrumentedTest {
         val playlists = InMemoryPlaylistStore(listOf(sourceId))
         val metadata = InMemoryMetadataStore()
         val lyrics = InMemoryLyricsStore()
+        val journal = InMemoryMoveJournalStore()
         val coordinator = MediaStoreSongRelocationCoordinator(
             context = context,
             playlists = playlists,
             metadata = metadata,
             lyrics = lyrics,
-            journal = InMemoryMoveJournalStore(),
+            journal = journal,
         )
         val targetLeaf = "音澜跨卷目标-$token"
 
@@ -710,8 +711,13 @@ class SongRelocationCoordinatorInstrumentedTest {
         }
 
         assertTrue(step is RelocationStep.Finished)
-        val state = (step as RelocationStep.Finished).state as MediaOperationState.Completed
-        assertEquals(1, state.summary.moved)
+        val finishedState = (step as RelocationStep.Finished).state
+        val finalJournalItem = journal.items(requireNotNull(journal.operationId)).single()
+        assertTrue(
+            "expected a completed cross-volume move; state=$finishedState; item=$finalJournalItem",
+            finishedState is MediaOperationState.Completed && finishedState.summary.moved == 1,
+        )
+        val state = finishedState as MediaOperationState.Completed
         val destinationId = playlists.remaps[sourceId] ?: sourceId
         val destinationUri = ContentUris.withAppendedId(
             MediaStore.Audio.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY),
@@ -1651,7 +1657,8 @@ class SongRelocationCoordinatorInstrumentedTest {
         val step = coordinator.start("音澜授权目标-$token") {}
 
         assertTrue(
-            "expected a delete authorization request after the verified cross-volume copy",
+            "expected a delete authorization request after the verified cross-volume copy; " +
+                "state=$step; item=${journal.items(requireNotNull(journal.operationId)).single()}",
             step is RelocationStep.AwaitingAuthorization,
         )
         val copied = journal.items(requireNotNull(journal.operationId)).single()
