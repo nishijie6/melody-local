@@ -877,7 +877,9 @@ class MediaStoreSongRelocationCoordinator(
             MediaStore.MediaColumns.VOLUME_NAME,
         )
         return runCatching {
-            val cursor = mediaAccess.query(resolver, destination, projection) ?: return false
+            @Suppress("DEPRECATION")
+            val queryUri = MediaStore.setIncludePending(destination)
+            val cursor = mediaAccess.query(resolver, queryUri, projection) ?: return false
             cursor.use {
                 if (!it.moveToFirst()) return false
                 fun string(column: String): String? =
@@ -2293,8 +2295,10 @@ class MediaStoreSongRelocationCoordinator(
             return false
         }
         val rowMatches = try {
+            @Suppress("DEPRECATION")
+            val queryUri = MediaStore.setIncludePending(uri)
             resolver.query(
-                uri,
+                queryUri,
                 arrayOf(
                     MediaStore.Audio.Media._ID,
                     MediaStore.Audio.Media.IS_PENDING,
@@ -2446,8 +2450,10 @@ class MediaStoreSongRelocationCoordinator(
             item.operationId,
             item.oldSongId,
         )
+        @Suppress("DEPRECATION")
+        val pendingCollection = MediaStore.setIncludePending(collection)
         val cursor = resolver.query(
-            collection,
+            pendingCollection,
             arrayOf(MediaStore.Audio.Media._ID),
             "${MediaStore.Audio.Media.IS_PENDING} = 1 AND (" +
                 "${MediaStore.Audio.Media.RELATIVE_PATH} = ? OR (" +
