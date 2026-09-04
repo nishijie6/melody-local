@@ -1,7 +1,11 @@
 package com.melody.local.playback
 
 import android.content.Context
+import android.media.AudioManager
+import android.media.AudioPlaybackConfiguration
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import androidx.annotation.OptIn
 import androidx.core.content.edit
 import androidx.media3.common.AudioAttributes
@@ -42,6 +46,44 @@ class MusicService : MediaSessionService() {
     private var systemUiMetadataBackup: SystemUiMetadataBackup? = null
     private val modeScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val playbackModeRequestId = AtomicLong()
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val audioManager by lazy {
+        getSystemService(Context.AUDIO_SERVICE) as AudioManager
+    }
+    private var resumeAfterCompetingPlayback = false
+    private var interruptedMediaId: String? = null
+    private val resumePlaybackRunnable = Runnable { resumeAfterCompetingPlaybackEnds() }
+    private val playbackActivityCallback = object : AudioManager.AudioPlaybackCallback() {
+        override fun onPlaybackConfigChanged(configs: List<AudioPlaybackConfiguration>) {
+            updateResumeSchedule(configs)
+        }
+    }
+    private val playerListener = object : Player.Listener {
+        override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
+            val player = mediaSession?.player ?: return
+            if (
+                !playWhenReady &&
+                reason == Player.PLAY_WHEN_READY_CHANGE_REASON_AUDIO_FOCUS_LOSS
+            ) {
+                rememberInterruptedPlayback(player)
+            } else {
+                cancelInterruptedPlaybackResume()
+            }
+        }
+
+        override fun onEvents(player: Player, events: Player.Events) {
+            if (
+                resumeAfterCompetingPlayback &&
+                (
+                    player.currentMediaItem?.mediaId != interruptedMediaId ||
+                        player.playbackState == Player.STATE_IDLE ||
+                        player.playbackState == Player.STATE_ENDED
+                    )
+            ) {
+                cancelInterruptedPlaybackResume()
+            }
+        }
+    }
     private val preferences by lazy {
         getSharedPreferences(PLAYBACK_PREFERENCES, Context.MODE_PRIVATE)
     }
@@ -92,6 +134,7 @@ class MusicService : MediaSessionService() {
             .setAudioAttributes(audioAttributes, true)
             .setHandleAudioBecomingNoisy(true)
             .build()
+        player.addListener(playerListener)
         systemLyricsSettings = SystemLyricsSettings(this)
         lyricsNotificationProvider = LyricsMediaNotificationProvider(this, systemLyricsSettings)
         setMediaNotificationProvider(lyricsNotificationProvider)
@@ -110,24 +153,84 @@ class MusicService : MediaSessionService() {
                 }
             }
         }.also { it.start() }
+        audioManager.registerAudioPlaybackCallback(playbackActivityCallback, mainHandler)
     }
 
     override fun onGetSession(
         controllerInfo: MediaSession.ControllerInfo,
     ): MediaSession? = mediaSession
 
+    override fun onUpdateNotification(
+        session: MediaSession,
+        startInForegroundRequired: Boolean,
+    ) {
+        super.onUpdateNotification(
+            session,
+            startInForegroundRequired || resumeAfterCompetingPlayback,
+        )
+    }
+
     override fun onDestroy() {
         playbackModeRequestId.incrementAndGet()
         systemLyricsCoordinator?.close()
         systemLyricsCoordinator = null
         modeScope.cancel()
+        cancelInterruptedPlaybackResume()
+        audioManager.unregisterAudioPlaybackCallback(playbackActivityCallback)
         mediaSession?.run {
             restoreSystemUiLyricMetadata(player)
+            player.removeListener(playerListener)
             player.release()
             release()
         }
         mediaSession = null
         super.onDestroy()
+    }
+
+    private fun rememberInterruptedPlayback(player: Player) {
+        val mediaId = player.currentMediaItem?.mediaId
+        if (
+            mediaId == null ||
+            player.playbackState == Player.STATE_IDLE ||
+            player.playbackState == Player.STATE_ENDED
+        ) {
+            cancelInterruptedPlaybackResume()
+            return
+        }
+        interruptedMediaId = mediaId
+        resumeAfterCompetingPlayback = true
+        // A permanent focus loss has no matching gain callback, so wait for active playback to end.
+        updateResumeSchedule(audioManager.activePlaybackConfigurations)
+    }
+
+    private fun updateResumeSchedule(configs: List<AudioPlaybackConfiguration>) {
+        mainHandler.removeCallbacks(resumePlaybackRunnable)
+        if (resumeAfterCompetingPlayback && configs.isEmpty()) {
+            mainHandler.postDelayed(resumePlaybackRunnable, RESUME_DELAY_MS)
+        }
+    }
+
+    private fun resumeAfterCompetingPlaybackEnds() {
+        val player = mediaSession?.player
+        if (
+            !resumeAfterCompetingPlayback ||
+            player == null ||
+            player.currentMediaItem?.mediaId != interruptedMediaId ||
+            player.playWhenReady ||
+            player.playbackState == Player.STATE_IDLE ||
+            player.playbackState == Player.STATE_ENDED
+        ) {
+            cancelInterruptedPlaybackResume()
+            return
+        }
+        if (audioManager.activePlaybackConfigurations.isNotEmpty()) return
+        player.play()
+    }
+
+    private fun cancelInterruptedPlaybackResume() {
+        mainHandler.removeCallbacks(resumePlaybackRunnable)
+        resumeAfterCompetingPlayback = false
+        interruptedMediaId = null
     }
 
     private fun applyPlaybackMode(
@@ -297,5 +400,6 @@ class MusicService : MediaSessionService() {
 
     private companion object {
         const val PLAYBACK_PREFERENCES = "playback_preferences"
+        const val RESUME_DELAY_MS = 500L
     }
 }

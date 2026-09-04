@@ -152,7 +152,7 @@ app/src/main/java/com/melody/local/
 .\gradlew.bat connectedDebugAndroidTest
 ```
 
-当前工程包含 196 项自动化测试：94 项 JVM 单元测试覆盖 LRC/增强 LRC、多语分层、ID3/FLAC/MP4 内嵌标签、同目录及 LRCLIB 匹配、歌词编辑、输出路由与延迟策略，以及播放、歌单和媒体操作恢复规则；102 项 Android 集成测试覆盖歌词持久化、授权目录真实文件名匹配、系统歌词元数据、具体 MediaStore 卷、真实歌曲移动与恢复、Media3、Room 迁移、ViewModel 竞态，以及 AAC 直封装和非 AAC 转码。CI 在 API 26、29、36 模拟器执行设备测试；API 29 与 36 作业要求可写的第二存储卷，若未正确挂载会直接失败，避免跨卷用例被静默跳过。
+当前工程包含 197 项自动化测试：94 项 JVM 单元测试覆盖 LRC/增强 LRC、多语分层、ID3/FLAC/MP4 内嵌标签、同目录及 LRCLIB 匹配、歌词编辑、输出路由与延迟策略，以及播放、歌单和媒体操作恢复规则；103 项 Android 集成测试覆盖歌词持久化、授权目录真实文件名匹配、系统歌词元数据、具体 MediaStore 卷、真实歌曲移动与恢复、Media3、Room 迁移、ViewModel 竞态、音频焦点恢复，以及 AAC 直封装和非 AAC 转码。CI 在 API 26、29、36 模拟器执行设备测试；API 29 与 36 作业要求可写的第二存储卷，若未正确挂载会直接失败，避免跨卷用例被静默跳过。
 
 ## 文档
 
