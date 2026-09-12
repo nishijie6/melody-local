@@ -64,7 +64,7 @@ The current schema still keys playlist membership, lyric files and metadata over
 
 ### Playback
 
-`MusicService` owns the ExoPlayer and MediaSession. Media3 supplies background playback, system media controls, audio-focus handling and noisy-output handling.
+`MusicService` owns the ExoPlayer, MediaSession and persisted audio-focus policy. Standard mode delegates focus handling to Media3. The opt-in audio-mixing mode calls `setAudioAttributes(..., false)`, causing ExoPlayer to abandon focus and keep `playWhenReady` without competing for ownership; noisy-output handling remains enabled. Turning mixing on after a focus-caused interruption resumes only the same still-playable item, while a manual pause remains paused. Turning it off immediately restores Media3 focus handling. Android may mix multiple media tracks, but another app or the system can still impose an exclusive or call-related policy.
 
 `SystemLyricsCoordinator` runs beside the service-owned player. It loads the current song's private lyric copy and, when none exists, performs the same local-first automatic discovery from service scope so discovery continues after the Activity stops. The UI and service share one process-wide repository/resolver, per-song locks and a monotonic content revision, preventing duplicate network requests and stale UI state. The coordinator samples the active line while playing, applies the configured output-route delay and publishes only when the visible system-lyrics snapshot changes. On every supported Android version, `MusicService` exposes the line through the MediaSession item's `displayTitle`/`subtitle` while preserving title, artist and album; the original display metadata is restored when the line is blank, the setting is disabled, the queue advances or playback is stopped. Before Android 13, the custom notification provider additionally keeps the canonical song title in the notification and places the current line in secondary text. Android 13 and newer render the system media card directly from session metadata. Whether a pre-Android 13 OEM lock screen consumes those display fields, and the final layout on every version, remain controlled by Android and the device manufacturer.
 
@@ -72,7 +72,7 @@ The optional `FloatingLyricsService` is a user-enabled special-use foreground se
 
 `AudioOutputMonitor` observes only public Android routing APIs and classifies the selected media output as speaker, wired, classic Bluetooth, Bluetooth LE, USB, HDMI or unknown. Android 13+ uses `AudioManager.getAudioDevicesForAttributes` for media attributes; Android 8–12 combines the selected live-audio `MediaRouter` route with connected-device detail, so a paired but inactive Bluetooth device cannot override the active speaker route. `LyricsTimingPolicy` applies a conservative per-route estimate; it does not measure Bluetooth codec or hardware latency. A separately persisted `-5000…5000 ms` manual correction for each route is added to that estimate, allowing device-specific calibration.
 
-`MusicService` owns the active playback mode and ExoPlayer traversal policy. `PlayerConnection` only sends Media3 player commands and a custom mode command, so Activity/ViewModel recreation cannot lose queue authority.
+`MusicService` owns the active playback mode, ExoPlayer traversal policy and audio-mixing preference. `PlayerConnection` only sends Media3 player commands plus custom mode/mixing commands and observes authoritative values through session extras, so Activity/ViewModel recreation cannot lose queue or focus-policy authority.
 
 | Mode | ExoPlayer traversal | Repeat policy |
 |---|---|---|
@@ -84,7 +84,15 @@ The optional `FloatingLyricsService` is a user-enabled special-use foreground se
 
 The Media3 playlist always remains canonical. Mode changes update only shuffle traversal and repeat flags inside `MusicService`; the current MediaItem, position and buffer are never replaced. Reverse and all non-random changes are O(1). Random setup is O(n), but its shuffle arrays are built on `Dispatchers.Default`, outside the main/UI thread. A monotonically increasing request generation and a queue-size check discard stale random results, so rapid mode changes and queue replacement cannot apply an obsolete traversal policy.
 
-### Playlists
+Every queue item also carries a small typed source snapshot and queue generation in `MediaMetadata.extras`: either the library/search label or the originating playlist ID and name. `PlayerConnection` projects the service-owned Media3 timeline into `PlaybackUiState` as a read-only queue, source and current index. It rebuilds that projection on initial connection, explicit queue replacement, structural timeline changes or projected title/art changes; `MusicService` publishes a separate queue-content revision through session extras when app-local title/art overrides change, so queued-only edits are projected without treating display-only lyric metadata as queue content. Display-only lyric changes and the 400 ms position loop reuse the existing list. `MusicService` uses the queue generation to avoid rescanning the whole service playlist for every notification-lyric transition. Selecting an item calls Media3's indexed seek and never calls `setMediaItems`, `prepare` or changes the playback mode. The full-screen player therefore shows the source and queue after Activity recreation or controller reconnection without becoming queue authority, initially positions long lists at the current item, and does not force-follow while the user browses. The current project does not restore a queue after the whole playback service/process has been terminated.
+
+### Song metadata editing
+
+`LocalSongMetadataEditor` writes app-local title/artist/album/artwork overrides through the existing `SongMetadataStore`; it does not modify embedded audio tags or song identity. Replacement images are bounded to 20 MiB, normalized for EXIF rotation/mirroring, downsampled to at most 1024 pixels per side and copied to unique private artwork files. A failed database write removes the newly created cover and preserves the previous record. A reference-aware sweep removes app-owned, unreferenced covers only after a 24-hour grace period and never removes the immediately replaced file in the same transaction, so running media sessions can switch metadata first.
+
+`MainViewModel` owns the editing target and save/error state, blocks duplicate saves and overlapping playlist relocation, and rejects ambiguous or changed song identities. Playlist relocation sets an identity-refresh gate synchronously when an operation starts. Completed, cancelled and recoverably failed work all force a fresh MediaStore load; only a successful post-operation load unlocks editing, while a failed load leaves the gate closed for a later retry. A refresh generation discards older library loads. Failed identity refreshes retain the last visible library and expose a persistent retry action. Ordinary refreshes can still overlap a save because the metadata revision makes them retry instead of publishing stale values. `MusicService` observes committed overrides through Room even when the UI controller is closed. It updates only matching items' metadata, preserving the canonical queue, playback position and mode, and refreshing system lyric subtitles. Reapplying unchanged values is a no-op, avoiding a timeline-event loop.
+
+### Playlist storage
 
 Room stores playlists in `playlists` and membership in `playlist_songs`. The join table uses `(playlistId, songId)` as its primary key, so a song cannot appear twice in one playlist. A foreign key removes memberships when their playlist is deleted.
 
@@ -110,13 +118,13 @@ The in-app editor operates on the stored LRC source. It can insert the adjusted 
 ```text
 Room database            playlist definitions and membership
                          metadata overrides and relocation journal
-SharedPreferences        selected playback mode
+SharedPreferences        selected playback mode and opt-in audio-mixing policy
                          active WorkManager/legacy import recovery IDs
                          lyric discovery preferences and persisted SAF tree URIs
                          overlay/notification settings and per-output-route lyric delays
 filesDir/lyrics          adopted local, embedded, downloaded or edited LRC text
                          per-song automatic-rediscovery suppression markers
-filesDir/artwork         compressed video-frame covers (max edge 1024 px)
+filesDir/artwork         compressed video-frame and user-selected covers (max edge 1024 px)
 MediaStore               source of audio metadata and content URIs
 ```
 

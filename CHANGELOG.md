@@ -2,6 +2,33 @@
 
 All notable changes to this project are documented in this file.
 
+## Unreleased
+
+## 1.5.0 - 2026-09-12
+
+### Added
+
+- Added post-import song editing from library and playlist song menus: title, artist, album and a privately copied replacement cover. Changes remain local to the app and preserve song IDs, playlist membership and source audio.
+- Added service-owned metadata refresh for current and queued songs without resetting playback position or playback mode, including updated system lyric subtitles.
+- Added regression coverage for metadata persistence, artwork copying and failure cleanup, editor restoration, stale library refreshes, and playing/paused metadata updates.
+- Added a persistent, opt-in “与其他应用同时播放” control. It disables Media3 audio-focus management at runtime so compatible media apps can remain audible together, while the default standard focus behavior and headphone-disconnect handling remain unchanged.
+- Added device regressions that verify two active playback configurations in mixing mode and immediate recovery of the same focus-interrupted track when mixing is enabled; the existing standard-focus interruption/recovery test remains active.
+- Added the source playlist and a complete queue tab to the full-screen player, with current-song highlighting and queue selection that preserves the existing Media3 timeline and playback mode across UI reconnection.
+
+### Changed
+
+- Raised the application version to `1.5.0` / Android `versionCode` 7.
+
+### Fixed
+
+- Prevented song-info editing from targeting a stale MediaStore ID while the library refreshes after playlist-file relocation.
+- Applied JPEG EXIF rotation and mirroring before saving a replacement cover, so camera photos keep the orientation shown in the system picker.
+- Kept editing locked through recoverable relocation failures, forced a fresh MediaStore read after every terminal outcome, surfaced a retry when that identity refresh fails, and discarded older in-flight library results.
+- Avoided rebuilding and rescanning large playback queues for display-only notification-lyric updates.
+- Prevented repeated cover replacement from accumulating old private JPEGs indefinitely while preserving a 24-hour grace period for running sessions.
+- Starting the same song from a different visible library, search or playlist source now establishes that source as the active queue instead of reopening an unrelated queue.
+- The queue tab now opens at the current item in long lists, player tabs and the audio-mixing row expose their selected state to accessibility services, and the song editor shows the standard artwork fallback when no cover can be loaded.
+
 ## 1.4.0 - 2026-09-04
 
 ### Added

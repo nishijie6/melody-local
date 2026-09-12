@@ -1,6 +1,6 @@
 # Privacy
 
-Effective date: 2026-09-04
+Effective date: 2026-09-12
 
 音澜 is designed as a local-first music player. It does not include accounts, advertising, analytics or telemetry. The application requests Android's `INTERNET` permission only for LRCLIB lyric search and download; automatic online matching is disabled by default, so the app does not contact LRCLIB unless you manually search or explicitly enable that setting.
 
@@ -19,11 +19,12 @@ If you manually search LRCLIB, the app sends your search keywords or the current
 ## Data stored on the device
 
 - Playlists and playlist membership are stored in a local Room database.
-- The selected playback mode is stored in local SharedPreferences.
+- The selected playback mode and the opt-in “与其他应用同时播放” preference are stored in local SharedPreferences.
 - Lyrics adopted from manual import, same-directory matching, embedded tags or LRCLIB are stored as LRC text in the app's private `lyrics/` directory. In-app edits atomically replace this private copy. Removing a lyric stores a zero-content per-song marker in the same private directory to prevent automatic rediscovery until you manually match, import, edit or choose a new result.
 - Persisted system-directory read grants and lyric discovery preferences are stored locally; automatic local/embedded matching defaults on, while automatic LRCLIB matching defaults off.
 - Floating-lyrics, notification-lyrics and automatic-delay preferences, overlay position, and the manual delay for each output-route category are stored in local preferences. The overlay defaults off; notification lyrics and automatic route estimates default on and can be disabled.
 - Titles, artists and albums edited during video import, plus references to compressed first-frame artwork, are stored in the local Room database and private `artwork/` directory.
+- Titles, artists, albums and covers edited after import are also stored only in the app's local database and private `artwork/` directory. Selected cover images are read through the system file picker and copied locally; neither the image nor edited metadata is uploaded. This editing does not rewrite the source audio file's tags. An unreferenced replaced cover is retained for at least 24 hours so running playback sessions can switch safely, then eligible files are removed during a later successful edit; current or shared references are never swept. Remaining private covers are removed when app data is cleared or the app is uninstalled.
 - Incomplete playlist-file moves are recorded in a local operation journal so the app can remove an uncommitted copy or finish ID remapping after process interruption.
 - Video audio exports are written to `Music/音澜/视频提取/`. The “汇总歌单歌曲” action truly moves selected playlist files to `Music/音澜/<chosen folder>/`; after a successful move the old path no longer contains the file.
 - Playback state exists in the local Media3 session while the app or playback service is running.
