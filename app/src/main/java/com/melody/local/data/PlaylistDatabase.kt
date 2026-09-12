@@ -173,6 +173,9 @@ abstract class PlaylistDao {
 @Dao
 abstract class SongStateDao {
     @Query("SELECT * FROM song_overrides")
+    abstract fun observeOverrides(): Flow<List<SongOverrideEntity>>
+
+    @Query("SELECT * FROM song_overrides")
     abstract suspend fun getAllOverrides(): List<SongOverrideEntity>
 
     @Query("SELECT * FROM song_overrides WHERE songId = :songId LIMIT 1")

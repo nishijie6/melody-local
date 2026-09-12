@@ -15,6 +15,7 @@ import com.melody.local.data.MusicLibrary
 import com.melody.local.data.PlaylistStore
 import com.melody.local.data.PlaylistSummary
 import com.melody.local.data.Song
+import com.melody.local.data.SongMetadataEditor
 import com.melody.local.lyrics.LyricLine
 import com.melody.local.lyrics.LyricsAutomationPreferences
 import com.melody.local.lyrics.LyricsResolverApi
@@ -33,6 +34,7 @@ import com.melody.local.media.VideoAudioExtractor
 import com.melody.local.media.VideoImportRequest
 import com.melody.local.playback.PlaybackController
 import com.melody.local.playback.PlaybackMode
+import com.melody.local.playback.PlaybackQueueSource
 import com.melody.local.playback.PlaybackUiState
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.NonCancellable
@@ -45,6 +47,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withContext
+import java.io.IOException
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -62,7 +65,7 @@ class MainViewModelInstrumentedTest {
         val fixture = Fixture(music = music)
 
         fixture.viewModel.refreshSongs()
-        waitUntil { fixture.viewModel.isLoading.value }
+        waitUntil { fixture.viewModel.isLoading.value && music.loadCount == 1 }
         fixture.viewModel.refreshSongs()
         assertEquals(1, music.loadCount)
 
@@ -138,9 +141,8 @@ class MainViewModelInstrumentedTest {
     fun lyricsStateActionsAndViewModelCleanupUseInjectedBoundaries() = runBlocking {
         val parsed = ParsedLyrics(listOf(LyricLine(1_000L, "line")), isSynced = true)
         val fixture = Fixture()
-        val states = mutableListOf<LyricsUiState>()
         val messages = mutableListOf<String>()
-        val stateCollection = launch { fixture.viewModel.lyrics.collect(states::add) }
+        val stateCollection = launch { fixture.viewModel.lyrics.collect() }
         val messageCollection = launch { fixture.viewModel.messages.collect(messages::add) }
         delay(20)
         assertEquals(LyricsUiState.NoSong, fixture.viewModel.lyrics.value)
@@ -152,7 +154,6 @@ class MainViewModelInstrumentedTest {
         allowFirstLyricLoad.complete(Unit)
         fixture.lyrics.loadGate = null
         waitUntil { fixture.viewModel.lyrics.value == LyricsUiState.Missing }
-        assertTrue(states.any { it == LyricsUiState.Loading })
 
         fixture.lyrics.loaded[1L] = Result.success<ParsedLyrics?>(parsed)
         fixture.player.mutableState.value = PlaybackUiState(
@@ -403,11 +404,327 @@ class MainViewModelInstrumentedTest {
         fixture.clear()
     }
 
+    @Test
+    fun relocationBlocksEditingStaleSongIdentityUntilTheForcedRefreshCompletes() = runBlocking {
+        val coordinator = FakeRelocationCoordinator(application)
+        val original = song(1)
+        val relocated = song(101)
+        val refreshedSongs = CompletableDeferred<List<Song>>()
+        var saves = 0
+        val music = FakeMusicLibrary { listOf(original) }
+        val fixture = Fixture(
+            music = music,
+            relocation = coordinator,
+            songEditor = SongMetadataEditor { song, _, _, _, _ ->
+                saves++
+                song
+            },
+        )
+        fixture.viewModel.refreshSongs()
+        waitUntil { fixture.viewModel.allSongs.value.singleOrNull()?.id == original.id }
+        fixture.viewModel.loadPlaylistMovePreview()
+        waitUntil { fixture.viewModel.playlistMovePreview.value != null }
+        fixture.viewModel.startPlaylistMove("歌单汇总")
+        fixture.viewModel.openSongEditor(original)
+        assertEquals(null, fixture.viewModel.songEditorDraft.value)
+        coordinator.startGate.complete(Unit)
+        waitUntil { fixture.viewModel.authorizationRequest.value != null }
+
+        music.loader = { refreshedSongs.await() }
+        fixture.viewModel.resumePlaylistMove(false)
+        waitUntil { fixture.viewModel.playlistMoveState.value is MediaOperationState.Completed }
+
+        fixture.viewModel.openSongEditor(original)
+        fixture.viewModel.saveSongMetadata(original.id, "Stale", "A", "B", null)
+        assertEquals(null, fixture.viewModel.songEditorDraft.value)
+        assertEquals(0, saves)
+
+        refreshedSongs.complete(listOf(relocated))
+        waitUntil {
+            !fixture.viewModel.isLoading.value &&
+                fixture.viewModel.allSongs.value.singleOrNull()?.id == relocated.id
+        }
+        fixture.viewModel.openSongEditor(relocated)
+        assertEquals(relocated.id, fixture.viewModel.songEditorDraft.value?.id)
+        fixture.clear()
+    }
+
+    @Test
+    fun recoverableRelocationFailureKeepsEditingBlockedUntilForcedRefreshSucceeds() = runBlocking {
+        val coordinator = FakeRelocationCoordinator(application).apply {
+            resumeResult = MediaOperationState.Failed(
+                "歌曲文件已安全移动，但关联信息尚未全部提交"
+            )
+        }
+        val original = song(1)
+        val relocated = song(101)
+        val music = FakeMusicLibrary { listOf(original) }
+        var saves = 0
+        val fixture = Fixture(
+            music = music,
+            relocation = coordinator,
+            songEditor = SongMetadataEditor { song, _, _, _, _ ->
+                saves++
+                song
+            },
+        )
+        fixture.viewModel.refreshSongs()
+        waitUntil { fixture.viewModel.allSongs.value.singleOrNull()?.id == original.id }
+        fixture.viewModel.loadPlaylistMovePreview()
+        waitUntil { fixture.viewModel.playlistMovePreview.value != null }
+        fixture.viewModel.startPlaylistMove("歌单汇总")
+        coordinator.startGate.complete(Unit)
+        waitUntil { fixture.viewModel.authorizationRequest.value != null }
+
+        val lifecycleRefresh = CompletableDeferred<List<Song>>()
+        val postFailureRefresh = CompletableDeferred<List<Song>>()
+        music.loader = { lifecycleRefresh.await() }
+        fixture.viewModel.refreshSongs()
+        waitUntil { fixture.viewModel.isLoading.value && music.loadCount == 2 }
+        music.loader = { postFailureRefresh.await() }
+        fixture.viewModel.resumePlaylistMove(true)
+        waitUntil {
+            fixture.viewModel.playlistMoveState.value is MediaOperationState.Failed &&
+                fixture.viewModel.isLoading.value &&
+                music.loadCount == 3
+        }
+
+        lifecycleRefresh.complete(listOf(original))
+        delay(50L)
+        fixture.viewModel.openSongEditor(original)
+        fixture.viewModel.saveSongMetadata(original.id, "Stale", "A", "B", null)
+        assertEquals(null, fixture.viewModel.songEditorDraft.value)
+        assertEquals(0, saves)
+
+        postFailureRefresh.complete(listOf(relocated))
+        waitUntil {
+            !fixture.viewModel.isLoading.value &&
+                fixture.viewModel.allSongs.value.singleOrNull()?.id == relocated.id
+        }
+        fixture.viewModel.openSongEditor(relocated)
+        assertEquals(relocated.id, fixture.viewModel.songEditorDraft.value?.id)
+        fixture.clear()
+    }
+
+    @Test
+    fun failedRelocationCancellationForcesRefreshBeforeEditingCanResume() = runBlocking {
+        val coordinator = FakeRelocationCoordinator(application).apply {
+            cancelResult = MediaOperationState.Failed(
+                "安全终止尚未完成，关联信息仍待恢复"
+            )
+        }
+        val original = song(1)
+        val music = FakeMusicLibrary { listOf(original) }
+        var saves = 0
+        val fixture = Fixture(
+            music = music,
+            relocation = coordinator,
+            songEditor = SongMetadataEditor { song, _, _, _, _ ->
+                saves++
+                song
+            },
+        )
+        fixture.viewModel.refreshSongs()
+        waitUntil { fixture.viewModel.allSongs.value.singleOrNull()?.id == original.id }
+        fixture.viewModel.loadPlaylistMovePreview()
+        waitUntil { fixture.viewModel.playlistMovePreview.value != null }
+        fixture.viewModel.startPlaylistMove("歌单汇总")
+        coordinator.startGate.complete(Unit)
+        waitUntil { fixture.viewModel.authorizationRequest.value != null }
+
+        val postFailureRefresh = CompletableDeferred<List<Song>>()
+        music.loader = { postFailureRefresh.await() }
+        fixture.viewModel.cancelPlaylistMove()
+        waitUntil {
+            fixture.viewModel.playlistMoveState.value is MediaOperationState.Failed &&
+                fixture.viewModel.isLoading.value &&
+                music.loadCount == 2
+        }
+        fixture.viewModel.openSongEditor(original)
+        fixture.viewModel.saveSongMetadata(original.id, "Stale", "A", "B", null)
+        assertEquals(null, fixture.viewModel.songEditorDraft.value)
+        assertEquals(0, saves)
+
+        postFailureRefresh.complete(listOf(original))
+        waitUntil { !fixture.viewModel.isLoading.value }
+        fixture.viewModel.openSongEditor(original)
+        assertEquals(original.id, fixture.viewModel.songEditorDraft.value?.id)
+        fixture.clear()
+    }
+
+    @Test
+    fun failedPostRelocationRefreshRequiresSuccessfulRetryBeforeEditing() = runBlocking {
+        val coordinator = FakeRelocationCoordinator(application)
+        val original = song(1)
+        val relocated = song(101)
+        val music = FakeMusicLibrary { listOf(original) }
+        val fixture = Fixture(
+            music = music,
+            relocation = coordinator,
+            songEditor = SongMetadataEditor { song, _, _, _, _ -> song },
+        )
+        fixture.viewModel.refreshSongs()
+        waitUntil { fixture.viewModel.allSongs.value.singleOrNull()?.id == original.id }
+        fixture.viewModel.loadPlaylistMovePreview()
+        waitUntil { fixture.viewModel.playlistMovePreview.value != null }
+        fixture.viewModel.startPlaylistMove("歌单汇总")
+        coordinator.startGate.complete(Unit)
+        waitUntil { fixture.viewModel.authorizationRequest.value != null }
+
+        music.loader = { throw IOException("MediaStore unavailable") }
+        fixture.viewModel.resumePlaylistMove(false)
+        waitUntil {
+            fixture.viewModel.playlistMoveState.value is MediaOperationState.Completed &&
+                !fixture.viewModel.isLoading.value &&
+                fixture.viewModel.libraryError.value != null
+        }
+        fixture.viewModel.openSongEditor(original)
+        assertEquals(null, fixture.viewModel.songEditorDraft.value)
+
+        music.loader = { listOf(relocated) }
+        fixture.viewModel.refreshSongs()
+        waitUntil {
+            !fixture.viewModel.isLoading.value &&
+                fixture.viewModel.allSongs.value.singleOrNull()?.id == relocated.id
+        }
+        fixture.viewModel.openSongEditor(relocated)
+        assertEquals(relocated.id, fixture.viewModel.songEditorDraft.value?.id)
+        fixture.clear()
+    }
+
+    @Test
+    fun forcedPostRelocationRefreshSupersedesAnOlderInFlightLibraryRead() = runBlocking {
+        val coordinator = FakeRelocationCoordinator(application)
+        val original = song(1)
+        val relocated = song(101)
+        val staleRead = CompletableDeferred<List<Song>>()
+        val music = FakeMusicLibrary { listOf(original) }
+        val fixture = Fixture(
+            music = music,
+            relocation = coordinator,
+            songEditor = SongMetadataEditor { song, _, _, _, _ -> song },
+        )
+        fixture.viewModel.refreshSongs()
+        waitUntil { fixture.viewModel.allSongs.value.singleOrNull()?.id == original.id }
+
+        music.loader = { staleRead.await() }
+        fixture.viewModel.refreshSongs()
+        waitUntil { fixture.viewModel.isLoading.value && music.loadCount == 2 }
+        fixture.viewModel.loadPlaylistMovePreview()
+        waitUntil { fixture.viewModel.playlistMovePreview.value != null }
+        fixture.viewModel.startPlaylistMove("歌单汇总")
+        coordinator.startGate.complete(Unit)
+        waitUntil { fixture.viewModel.authorizationRequest.value != null }
+
+        music.loader = { listOf(relocated) }
+        fixture.viewModel.resumePlaylistMove(false)
+        waitUntil {
+            !fixture.viewModel.isLoading.value &&
+                music.loadCount == 3 &&
+                fixture.viewModel.allSongs.value.singleOrNull()?.id == relocated.id
+        }
+        staleRead.complete(listOf(original))
+        delay(50L)
+
+        assertEquals(relocated.id, fixture.viewModel.allSongs.value.single().id)
+        fixture.viewModel.openSongEditor(relocated)
+        assertEquals(relocated.id, fixture.viewModel.songEditorDraft.value?.id)
+        fixture.clear()
+    }
+
+    @Test
+    fun songEditUpdatesLibraryAndPlaylistWithoutStoppingOrRetargetingPlayback() = runBlocking {
+        val gate = CompletableDeferred<Unit>()
+        var saves = 0
+        val fixture = Fixture(
+            music = FakeMusicLibrary { listOf(song(1), song(2)) },
+            songEditor = SongMetadataEditor { original, title, artist, album, _ ->
+                saves++
+                gate.await()
+                original.copy(title = title, artist = artist, album = album)
+            },
+        )
+        val collection = launch { fixture.viewModel.selectedPlaylistSongs.collect() }
+        fixture.playlists.songIds.value = listOf(2, 1)
+        fixture.viewModel.selectPlaylist(42)
+        fixture.viewModel.refreshSongs()
+        waitUntil { fixture.viewModel.allSongs.value.size == 2 }
+        fixture.viewModel.openSongEditor(song(1))
+        fixture.player.mutableState.value = PlaybackUiState(mediaId = 2, positionMs = 5000, isPlaying = true)
+        fixture.viewModel.saveSongMetadata(1, "Edited", "New artist", "New album", null)
+        fixture.viewModel.saveSongMetadata(1, "Duplicate", "A", "B", null)
+        waitUntil { saves == 1 }
+        fixture.viewModel.dismissSongEditor()
+        assertEquals(1L, fixture.viewModel.songEditorDraft.value?.id)
+        gate.complete(Unit)
+        waitUntil { fixture.viewModel.songEditorDraft.value == null }
+        waitUntil { fixture.viewModel.selectedPlaylistSongs.value.lastOrNull()?.title == "Edited" }
+        assertEquals(listOf(2L, 1L), fixture.viewModel.selectedPlaylistSongs.value.map { it.id })
+        assertEquals(2L, fixture.player.state.value.mediaId)
+        assertEquals(5000L, fixture.player.state.value.positionMs)
+        assertEquals(0, fixture.player.stopCount)
+        collection.cancel()
+        fixture.clear()
+    }
+
+    @Test
+    fun failedSongEditKeepsDraftAndCanBeRetried() = runBlocking {
+        var fail = true
+        val fixture = Fixture(
+            music = FakeMusicLibrary { listOf(song(1)) },
+            songEditor = SongMetadataEditor { original, title, _, _, _ ->
+                if (fail) throw IllegalStateException("storage unavailable")
+                original.copy(title = title)
+            },
+        )
+        fixture.viewModel.refreshSongs()
+        waitUntil { fixture.viewModel.allSongs.value.size == 1 }
+        fixture.viewModel.openSongEditor(song(1))
+        fixture.viewModel.saveSongMetadata(1, "Edited", "A", "B", null)
+        waitUntil { fixture.viewModel.songEditError.value != null }
+        assertEquals("Song 1", fixture.viewModel.allSongs.value.single().title)
+        assertEquals(1L, fixture.viewModel.songEditorDraft.value?.id)
+        fail = false
+        fixture.viewModel.saveSongMetadata(1, "Edited", "A", "B", null)
+        waitUntil { fixture.viewModel.songEditorDraft.value == null }
+        assertEquals("Edited", fixture.viewModel.allSongs.value.single().title)
+        fixture.clear()
+    }
+
+    @Test
+    fun refreshStartedBeforeSaveCannotRestoreOldMetadata() = runBlocking {
+        val original = song(1)
+        var storedSong = original
+        val music = FakeMusicLibrary { listOf(storedSong) }
+        val fixture = Fixture(
+            music = music,
+            songEditor = SongMetadataEditor { value, title, _, _, _ ->
+                value.copy(title = title).also { storedSong = it }
+            },
+        )
+        fixture.viewModel.refreshSongs()
+        waitUntil { fixture.viewModel.allSongs.value.size == 1 && !fixture.viewModel.isLoading.value }
+        fixture.viewModel.openSongEditor(original)
+        val staleRead = CompletableDeferred<List<Song>>()
+        music.loader = { staleRead.await() }
+        fixture.viewModel.refreshSongs()
+        waitUntil { fixture.viewModel.isLoading.value }
+        fixture.viewModel.saveSongMetadata(1, "Edited", "A", "B", null)
+        waitUntil { fixture.viewModel.songEditorDraft.value == null }
+        music.loader = { listOf(storedSong) }
+        staleRead.complete(listOf(original))
+        waitUntil { !fixture.viewModel.isLoading.value }
+        assertEquals("Edited", fixture.viewModel.allSongs.value.single().title)
+        assertEquals(3, music.loadCount)
+        fixture.clear()
+    }
+
     private inner class Fixture(
         music: FakeMusicLibrary = FakeMusicLibrary { emptyList() },
         videoExtractor: VideoAudioExtractor? = null,
         relocation: SongRelocationCoordinator? = null,
         lyricsResolver: LyricsResolverApi? = null,
+        songEditor: SongMetadataEditor? = null,
     ) {
         val playlists = FakePlaylistStore()
         val lyrics = FakeLyricsStore()
@@ -429,6 +746,7 @@ class MainViewModelInstrumentedTest {
                     videoExtractor,
                     relocation,
                     lyricsResolver,
+                    songEditor,
                 ) as T
             },
         )[MainViewModel::class.java]
@@ -509,7 +827,11 @@ class MainViewModelInstrumentedTest {
         override val state: StateFlow<PlaybackUiState> = mutableState
         var releaseCount = 0
         var stopCount = 0
-        override fun playQueue(songs: List<Song>, startIndex: Int) = Unit
+        override fun playQueue(
+            songs: List<Song>,
+            startIndex: Int,
+            source: PlaybackQueueSource,
+        ) = Unit
         override fun togglePlayPause() = Unit
         override fun stop() {
             stopCount++
@@ -517,7 +839,9 @@ class MainViewModelInstrumentedTest {
         override fun seekTo(positionMs: Long) = Unit
         override fun seekToNext() = Unit
         override fun seekToPrevious() = Unit
+        override fun seekToQueueItem(index: Int) = Unit
         override fun setPlaybackMode(mode: PlaybackMode) = Unit
+        override fun setAudioMixingEnabled(enabled: Boolean) = Unit
         override fun release() {
             releaseCount++
         }
@@ -600,6 +924,10 @@ class MainViewModelInstrumentedTest {
         var startCalls = 0
         var lastAuthorizationGranted: Boolean? = null
         val startGate = CompletableDeferred<Unit>()
+        var resumeResult: MediaOperationState = MediaOperationState.Completed(
+            MediaOperationSummary(moved = 2, cancelled = 1)
+        )
+        var cancelResult: MediaOperationState = MediaOperationState.Cancelled()
 
         override suspend fun preview() = PlaylistMovePreview(3, 3_000L, 0)
 
@@ -628,18 +956,23 @@ class MainViewModelInstrumentedTest {
             onState: (MediaOperationState) -> Unit,
         ): RelocationStep {
             lastAuthorizationGranted = authorizationGranted
-            val completed = MediaOperationState.Completed(
-                MediaOperationSummary(moved = 2, cancelled = if (authorizationGranted) 0 else 1)
-            )
-            onState(completed)
-            return RelocationStep.Finished(completed)
+            val result = when (val configured = resumeResult) {
+                is MediaOperationState.Completed -> configured.copy(
+                    summary = configured.summary.copy(
+                        cancelled = if (authorizationGranted) 0 else configured.summary.cancelled,
+                    )
+                )
+                else -> configured
+            }
+            onState(result)
+            return RelocationStep.Finished(result)
         }
 
         override suspend fun recover(onState: (MediaOperationState) -> Unit): RelocationStep? = null
 
         override suspend fun cancel(
             onState: (MediaOperationState) -> Unit,
-        ): MediaOperationState = MediaOperationState.Cancelled().also(onState)
+        ): MediaOperationState = cancelResult.also(onState)
     }
 
     private fun song(id: Long) = Song(

@@ -50,6 +50,8 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -138,6 +140,12 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
@@ -163,6 +171,8 @@ import com.melody.local.media.VideoImportDraft
 import com.melody.local.media.validateDestinationFolder
 import com.melody.local.playback.PlaybackUiState
 import com.melody.local.playback.PlaybackMode
+import com.melody.local.playback.PlaybackQueueSource
+import com.melody.local.playback.PlaybackQueueSourceType
 import com.melody.local.systemlyrics.FloatingLyricsController
 import com.melody.local.systemlyrics.SystemLyricsSettings
 import com.melody.local.ui.theme.Coral
@@ -180,6 +190,7 @@ import kotlinx.coroutines.isActive
 import kotlin.math.roundToInt
 
 private enum class HomeTab { SONGS, PLAYLISTS }
+private enum class PlayerPage { COVER, LYRICS, QUEUE }
 
 private const val RECORD_ROTATION_DURATION_MS = 18_000
 private val ArtworkPalettes = listOf(
@@ -209,6 +220,9 @@ fun MelodyApp(
     val isLoading by viewModel.isLoading.collectAsStateWithLifecycle()
     val libraryError by viewModel.libraryError.collectAsStateWithLifecycle()
     val videoImportDraft by viewModel.videoImportDraft.collectAsStateWithLifecycle()
+    val songEditorDraft by viewModel.songEditorDraft.collectAsStateWithLifecycle()
+    val songEditSaving by viewModel.songEditSaving.collectAsStateWithLifecycle()
+    val songEditError by viewModel.songEditError.collectAsStateWithLifecycle()
     val videoImportState by viewModel.videoImportState.collectAsStateWithLifecycle()
     val playlistMovePreview by viewModel.playlistMovePreview.collectAsStateWithLifecycle()
     val playlistMoveState by viewModel.playlistMoveState.collectAsStateWithLifecycle()
@@ -329,17 +343,30 @@ fun MelodyApp(
     }
 
     if (showPlayer && playback.mediaId != null) {
+        val displayedPlayback = playback.queueSource
+            ?.takeIf { it.type == PlaybackQueueSourceType.PLAYLIST }
+            ?.playlistId
+            ?.let { playlistId -> playlists.firstOrNull { it.id == playlistId } }
+            ?.let { playlist ->
+                playback.copy(queueSource = playback.queueSource?.copy(name = playlist.name))
+            }
+            ?: playback
         BackHandler { showPlayer = false }
         NowPlayingScreen(
-            playback = playback,
+            playback = displayedPlayback,
             lyricsState = lyrics,
             onBack = { showPlayer = false },
             onTogglePlayback = viewModel.player::togglePlayPause,
             onPrevious = viewModel.player::seekToPrevious,
             onNext = viewModel.player::seekToNext,
-            onStopPlayback = viewModel.player::stop,
+            onQueueItemSelected = viewModel.player::seekToQueueItem,
+            onStopPlayback = {
+                viewModel.player.stop()
+                showPlayer = false
+            },
             onSeek = viewModel.player::seekTo,
             onPlaybackModeChange = viewModel.player::setPlaybackMode,
+            onAudioMixingChange = viewModel.player::setAudioMixingEnabled,
             onImportLyrics = viewModel::importLyrics,
             onDeleteLyrics = viewModel::deleteCurrentLyrics,
             onEditLyrics = viewModel::openLyricsEditor,
@@ -483,46 +510,88 @@ fun MelodyApp(
         ) { playlistId ->
             if (playlistId != null) {
                 val summary = playlists.firstOrNull { it.id == playlistId }
+                val queueSource = PlaybackQueueSource.playlist(
+                    id = playlistId,
+                    name = summary?.name ?: "歌单",
+                )
+                val currentQueueMatchesVisible = remember(
+                    playback.queueSource,
+                    playback.queueItems,
+                    queueSource,
+                    playlistSongs,
+                ) {
+                    playback.matchesVisibleQueue(queueSource, playlistSongs)
+                }
                 PlaylistDetailScreen(
+                    playlistId = playlistId,
                     title = summary?.name ?: "歌单",
                     songs = playlistSongs,
                     currentSongId = playback.mediaId,
+                    currentQueueMatchesVisible = currentQueueMatchesVisible,
                     onBack = { openPlaylistId = null },
-                    onPlay = { index -> viewModel.playSongs(playlistSongs, index) },
+                    onPlay = { index ->
+                        viewModel.playSongs(playlistSongs, index, queueSource)
+                    },
                     playbackMode = playback.playbackMode,
                     onRandomPlay = {
                         if (playlistSongs.isNotEmpty()) {
                             viewModel.player.setPlaybackMode(PlaybackMode.RANDOM)
-                            viewModel.playSongs(playlistSongs, playlistSongs.indices.random())
+                            viewModel.playSongs(
+                                playlistSongs,
+                                playlistSongs.indices.random(),
+                                queueSource,
+                            )
                         }
                     },
                     onAddSongs = { showSongPicker = true },
                     onRemove = { song -> viewModel.removeSongFromPlaylist(playlistId, song.id) },
+                    onEditSong = viewModel::openSongEditor,
                     onOpenPlayer = { showPlayer = true },
                 )
             } else {
                 when (selectedTab) {
-                    HomeTab.SONGS -> SongsScreen(
-                        songs = visibleSongs,
-                        totalSongCount = allSongs.size,
-                        query = query,
-                        sort = sort,
-                        isLoading = isLoading,
-                        error = libraryError,
-                        currentSongId = playback.mediaId,
-                        onQueryChange = viewModel::updateQuery,
-                        onSortChange = viewModel::updateSort,
-                        onRefresh = viewModel::refreshSongs,
-                        onImportVideo = {
-                            viewModel.dismissVideoImportResult()
-                            runWithLegacyWritePermission {
-                                videoPicker.launch(arrayOf("video/*"))
-                            }
-                        },
-                        onPlay = { index -> viewModel.playSongs(visibleSongs, index) },
-                        onAddToPlaylist = { playlistPickerSong = it },
-                        onOpenPlayer = { showPlayer = true },
-                    )
+                    HomeTab.SONGS -> {
+                        val visibleQueueSource = PlaybackQueueSource.library(
+                            if (query.isBlank()) "全部歌曲" else "搜索结果"
+                        )
+                        val currentQueueMatchesVisible = remember(
+                            playback.queueSource,
+                            playback.queueItems,
+                            visibleQueueSource,
+                            visibleSongs,
+                        ) {
+                            playback.matchesVisibleQueue(visibleQueueSource, visibleSongs)
+                        }
+                        SongsScreen(
+                            songs = visibleSongs,
+                            totalSongCount = allSongs.size,
+                            query = query,
+                            sort = sort,
+                            isLoading = isLoading,
+                            error = libraryError,
+                            currentSongId = playback.mediaId,
+                            currentQueueMatchesVisible = currentQueueMatchesVisible,
+                            onQueryChange = viewModel::updateQuery,
+                            onSortChange = viewModel::updateSort,
+                            onRefresh = viewModel::refreshSongs,
+                            onImportVideo = {
+                                viewModel.dismissVideoImportResult()
+                                runWithLegacyWritePermission {
+                                    videoPicker.launch(arrayOf("video/*"))
+                                }
+                            },
+                            onPlay = { index ->
+                                viewModel.playSongs(
+                                    visibleSongs,
+                                    index,
+                                    visibleQueueSource,
+                                )
+                            },
+                            onAddToPlaylist = { playlistPickerSong = it },
+                            onEditSong = viewModel::openSongEditor,
+                            onOpenPlayer = { showPlayer = true },
+                        )
+                    }
                     HomeTab.PLAYLISTS -> PlaylistsScreen(
                         playlists = playlists,
                         onCreate = {
@@ -612,6 +681,16 @@ fun MelodyApp(
             songs = allSongs.filterNot { it.id in existingIds },
             onDismiss = { showSongPicker = false },
             onSelect = { song -> viewModel.addSongToPlaylist(openPlaylistId!!, song.id) },
+        )
+    }
+
+    songEditorDraft?.let { song ->
+        SongMetadataEditorDialog(
+            song = song,
+            saving = songEditSaving,
+            error = songEditError,
+            onDismiss = viewModel::dismissSongEditor,
+            onSave = viewModel::saveSongMetadata,
         )
     }
 
@@ -731,12 +810,14 @@ private fun SongsScreen(
     isLoading: Boolean,
     error: String?,
     currentSongId: Long?,
+    currentQueueMatchesVisible: Boolean,
     onQueryChange: (String) -> Unit,
     onSortChange: (SongSort) -> Unit,
     onRefresh: () -> Unit,
     onImportVideo: () -> Unit,
     onPlay: (Int) -> Unit,
     onAddToPlaylist: (Song) -> Unit,
+    onEditSong: (Song) -> Unit,
     onOpenPlayer: () -> Unit,
 ) {
     LazyColumn(
@@ -777,6 +858,35 @@ private fun SongsScreen(
                 )
             }
             else -> {
+                if (error != null) {
+                    item {
+                        Surface(
+                            color = Coral.copy(alpha = 0.12f),
+                            shape = RoundedCornerShape(18.dp),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 20.dp, vertical = 8.dp)
+                                .testTag("library-refresh-error"),
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(start = 14.dp, end = 6.dp, top = 8.dp, bottom = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Icon(Icons.Rounded.Refresh, contentDescription = null, tint = CoralSoft)
+                                Spacer(Modifier.width(10.dp))
+                                Column(Modifier.weight(1f)) {
+                                    Text("曲库刷新失败", style = MaterialTheme.typography.titleSmall)
+                                    Text(
+                                        "$error；当前显示上次加载结果",
+                                        color = Muted,
+                                        style = MaterialTheme.typography.bodySmall,
+                                    )
+                                }
+                                TextButton(onClick = onRefresh) { Text("重试") }
+                            }
+                        }
+                    }
+                }
                 item {
                     Row(
                         modifier = Modifier
@@ -795,11 +905,17 @@ private fun SongsScreen(
                 itemsIndexed(songs, key = { _, song -> song.id }) { index, song ->
                     SongRow(
                         song = song,
+                        modifier = Modifier.testTag("library-song-${song.id}"),
                         isPlaying = song.id == currentSongId,
                         onClick = {
-                            if (song.id == currentSongId) onOpenPlayer() else onPlay(index)
+                            if (song.id == currentSongId && currentQueueMatchesVisible) {
+                                onOpenPlayer()
+                            } else {
+                                onPlay(index)
+                            }
                         },
                         onAddToPlaylist = { onAddToPlaylist(song) },
+                        onEdit = { onEditSong(song) },
                     )
                 }
             }
@@ -845,6 +961,7 @@ private fun SearchField(query: String, onQueryChange: (String) -> Unit) {
         onValueChange = onQueryChange,
         modifier = Modifier
             .fillMaxWidth()
+            .testTag("library-search")
             .padding(horizontal = 20.dp)
             .shadow(
                 elevation = 7.dp,
@@ -914,9 +1031,11 @@ private fun SortChip(label: String, selected: Boolean, onClick: () -> Unit) {
 @Composable
 private fun SongRow(
     song: Song,
+    modifier: Modifier = Modifier,
     isPlaying: Boolean,
     onClick: () -> Unit,
     onAddToPlaylist: (() -> Unit)?,
+    onEdit: () -> Unit,
     onRemove: (() -> Unit)? = null,
 ) {
     var menuExpanded by remember { mutableStateOf(false) }
@@ -925,7 +1044,7 @@ private fun SongRow(
         label = "song_background",
     )
     Row(
-        modifier = Modifier
+        modifier = modifier
             .fillMaxWidth()
             .background(background)
             .clickable(onClick = onClick)
@@ -967,6 +1086,14 @@ private fun SongRow(
                 Icon(Icons.Rounded.MoreVert, contentDescription = "更多", tint = Muted)
             }
             DropdownMenu(expanded = menuExpanded, onDismissRequest = { menuExpanded = false }) {
+                DropdownMenuItem(
+                    text = { Text("编辑歌曲信息") },
+                    leadingIcon = { Icon(Icons.Rounded.Edit, contentDescription = null) },
+                    onClick = {
+                        menuExpanded = false
+                        onEdit()
+                    },
+                )
                 if (onAddToPlaylist != null) {
                     DropdownMenuItem(
                         text = { Text("加入歌单") },
@@ -1146,15 +1273,18 @@ private fun PlaylistCard(
 
 @Composable
 private fun PlaylistDetailScreen(
+    playlistId: Long,
     title: String,
     songs: List<Song>,
     currentSongId: Long?,
+    currentQueueMatchesVisible: Boolean,
     playbackMode: PlaybackMode,
     onBack: () -> Unit,
     onPlay: (Int) -> Unit,
     onRandomPlay: () -> Unit,
     onAddSongs: () -> Unit,
     onRemove: (Song) -> Unit,
+    onEditSong: (Song) -> Unit,
     onOpenPlayer: () -> Unit,
 ) {
     BackHandler(onBack = onBack)
@@ -1234,11 +1364,17 @@ private fun PlaylistDetailScreen(
             itemsIndexed(songs, key = { _, song -> song.id }) { index, song ->
                 SongRow(
                     song = song,
+                    modifier = Modifier.testTag("playlist-song-${song.id}"),
                     isPlaying = song.id == currentSongId,
                     onClick = {
-                        if (song.id == currentSongId) onOpenPlayer() else onPlay(index)
+                        if (song.id == currentSongId && currentQueueMatchesVisible) {
+                            onOpenPlayer()
+                        } else {
+                            onPlay(index)
+                        }
                     },
                     onAddToPlaylist = null,
+                    onEdit = { onEditSong(song) },
                     onRemove = { onRemove(song) },
                 )
             }
@@ -1260,6 +1396,7 @@ private fun MiniPlayer(
         modifier = Modifier
             .fillMaxWidth()
             .padding(horizontal = 10.dp, vertical = 6.dp)
+            .testTag("mini-player")
             .clickable(onClick = onClick),
     ) {
         Column {
@@ -1317,9 +1454,11 @@ private fun NowPlayingScreen(
     onTogglePlayback: () -> Unit,
     onPrevious: () -> Unit,
     onNext: () -> Unit,
+    onQueueItemSelected: (Int) -> Unit,
     onStopPlayback: () -> Unit,
     onSeek: (Long) -> Unit,
     onPlaybackModeChange: (PlaybackMode) -> Unit,
+    onAudioMixingChange: (Boolean) -> Unit,
     onImportLyrics: (Long, Uri) -> Unit,
     onDeleteLyrics: () -> Unit,
     onEditLyrics: () -> Unit,
@@ -1327,7 +1466,7 @@ private fun NowPlayingScreen(
     onSearchOnlineLyrics: (String?) -> Unit,
     onOpenLyricsSettings: () -> Unit,
 ) {
-    var showLyrics by rememberSaveable { mutableStateOf(false) }
+    var selectedPage by rememberSaveable { mutableStateOf(PlayerPage.COVER) }
     val pendingLyricsSongId = rememberPendingLyricsSongId()
     var draggedPosition by remember(playback.mediaId) { mutableFloatStateOf(-1f) }
     val recordRotation = remember(playback.mediaId) {
@@ -1387,7 +1526,9 @@ private fun NowPlayingScreen(
             Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
                 Text("正在播放", style = MaterialTheme.typography.labelLarge, color = Muted)
                 Text(
-                    playback.album.ifBlank { "本地音乐" },
+                    playback.queueSource?.displayLabel
+                        ?: playback.album.ifBlank { "本地音乐" },
+                    modifier = Modifier.testTag("now-playing-source"),
                     style = MaterialTheme.typography.bodyMedium,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
@@ -1400,31 +1541,39 @@ private fun NowPlayingScreen(
             modifier = Modifier
                 .align(Alignment.CenterHorizontally)
                 .background(Color.White.copy(alpha = 0.72f), RoundedCornerShape(18.dp))
+                .selectableGroup()
                 .padding(3.dp),
         ) {
             PlayerTab(
                 label = "封面",
                 icon = Icons.Rounded.Album,
-                selected = !showLyrics,
-                onClick = { showLyrics = false },
+                selected = selectedPage == PlayerPage.COVER,
+                onClick = { selectedPage = PlayerPage.COVER },
             )
             PlayerTab(
                 label = "歌词",
                 icon = Icons.Rounded.Lyrics,
-                selected = showLyrics,
-                onClick = { showLyrics = true },
+                selected = selectedPage == PlayerPage.LYRICS,
+                onClick = { selectedPage = PlayerPage.LYRICS },
+            )
+            PlayerTab(
+                label = "队列",
+                icon = Icons.AutoMirrored.Rounded.QueueMusic,
+                selected = selectedPage == PlayerPage.QUEUE,
+                modifier = Modifier.testTag("now-playing-tab-queue"),
+                onClick = { selectedPage = PlayerPage.QUEUE },
             )
         }
 
         Crossfade(
-            targetState = showLyrics,
-            label = "cover_lyrics",
+            targetState = selectedPage,
+            label = "player_page",
             modifier = Modifier
                 .weight(1f)
                 .fillMaxWidth(),
-        ) { lyricsVisible ->
-            if (lyricsVisible) {
-                LyricsPanel(
+        ) { page ->
+            when (page) {
+                PlayerPage.LYRICS -> LyricsPanel(
                     lyricsState = lyricsState,
                     positionMs = (playback.positionMs - playback.lyricDelayMs).coerceAtLeast(0L),
                     onSeek = onSeek,
@@ -1438,8 +1587,13 @@ private fun NowPlayingScreen(
                     onSearchOnline = { onSearchOnlineLyrics(null) },
                     onOpenSettings = onOpenLyricsSettings,
                 )
-            } else {
-                Box(
+
+                PlayerPage.QUEUE -> PlaybackQueuePanel(
+                    playback = playback,
+                    onSelect = onQueueItemSelected,
+                )
+
+                PlayerPage.COVER -> Box(
                     modifier = Modifier
                         .fillMaxSize()
                         .padding(horizontal = 28.dp, vertical = 12.dp),
@@ -1501,7 +1655,9 @@ private fun NowPlayingScreen(
             ) {
                 PlaybackModeSelector(
                     mode = playback.playbackMode,
+                    audioMixingEnabled = playback.audioMixingEnabled,
                     onModeChange = onPlaybackModeChange,
+                    onAudioMixingChange = onAudioMixingChange,
                 )
                 IconButton(onClick = onPrevious, modifier = Modifier.size(56.dp)) {
                     Icon(Icons.Rounded.SkipPrevious, contentDescription = "上一首", modifier = Modifier.size(38.dp))
@@ -1535,17 +1691,131 @@ private fun NowPlayingScreen(
 }
 
 @Composable
+internal fun PlaybackQueuePanel(
+    playback: PlaybackUiState,
+    onSelect: (Int) -> Unit,
+) {
+    val items = playback.queueItems
+    if (items.isEmpty()) {
+        MessageState(
+            icon = Icons.AutoMirrored.Rounded.QueueMusic,
+            title = "当前没有播放队列",
+            message = "从曲库或歌单选择歌曲后，这里会显示完整队列",
+        )
+        return
+    }
+
+    val initialQueueIndex = playback.queueIndex.takeIf { it in items.indices } ?: 0
+    val queueIdentity = remember(items) { items.map { it.mediaId } }
+    val listState = rememberLazyListState(initialFirstVisibleItemIndex = initialQueueIndex)
+    LaunchedEffect(playback.queueSource, queueIdentity) {
+        if (playback.queueIndex in items.indices) {
+            listState.scrollToItem(playback.queueIndex)
+        }
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .testTag("now-playing-queue"),
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 24.dp, vertical = 14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text("播放队列", style = MaterialTheme.typography.titleLarge)
+                Text(
+                    playback.queueSource?.displayLabel ?: "当前播放列表",
+                    color = Muted,
+                    style = MaterialTheme.typography.bodyMedium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            val currentPosition = playback.queueIndex.takeIf { it in items.indices }
+                ?.plus(1)
+                ?: 0
+            Text("$currentPosition / ${items.size}", color = Muted)
+        }
+
+        LazyColumn(
+            state = listState,
+            modifier = Modifier.fillMaxSize(),
+            contentPadding = PaddingValues(bottom = 12.dp),
+        ) {
+            itemsIndexed(
+                items = items,
+                key = { index, item -> "${item.mediaId ?: "unknown"}:$index" },
+            ) { index, item ->
+                val isCurrent = index == playback.queueIndex
+                Surface(
+                    color = if (isCurrent) Coral.copy(alpha = 0.16f) else Color.Transparent,
+                    shape = RoundedCornerShape(18.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 18.dp, vertical = 4.dp)
+                        .testTag("now-playing-queue-item-$index")
+                        .selectable(
+                            selected = isCurrent,
+                            onClick = { onSelect(index) },
+                        ),
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        AlbumArtwork(item.artworkUri, item.title, 48.dp, 14.dp)
+                        Spacer(Modifier.width(12.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text(
+                                item.title,
+                                style = MaterialTheme.typography.titleMedium,
+                                color = if (isCurrent) Ink else Cream,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            Text(
+                                item.artist,
+                                color = Muted,
+                                style = MaterialTheme.typography.bodyMedium,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                        if (isCurrent) {
+                            Icon(
+                                Icons.Rounded.GraphicEq,
+                                contentDescription = "当前播放",
+                                tint = Coral,
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
 private fun PlaybackModeSelector(
     mode: PlaybackMode,
+    audioMixingEnabled: Boolean,
     onModeChange: (PlaybackMode) -> Unit,
+    onAudioMixingChange: (Boolean) -> Unit,
 ) {
     var expanded by remember { mutableStateOf(false) }
     Box {
         IconButton(onClick = { expanded = true }) {
             Icon(
                 imageVector = mode.icon,
-                contentDescription = "播放模式：${mode.displayName}",
-                tint = if (mode == PlaybackMode.SEQUENTIAL) Muted else Coral,
+                contentDescription = buildString {
+                    append("播放设置：${mode.displayName}")
+                    if (audioMixingEnabled) append("，与其他应用同时播放")
+                },
+                tint = if (mode == PlaybackMode.SEQUENTIAL && !audioMixingEnabled) Muted else Coral,
             )
         }
         DropdownMenu(
@@ -1591,6 +1861,49 @@ private fun PlaybackModeSelector(
                     },
                 )
             }
+            HorizontalDivider(
+                modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                color = SurfaceRaised,
+            )
+            DropdownMenuItem(
+                modifier = Modifier.semantics {
+                    role = Role.Switch
+                    stateDescription = if (audioMixingEnabled) "已开启" else "已关闭"
+                },
+                text = {
+                    Column {
+                        Text(
+                            "与其他应用同时播放",
+                            color = if (audioMixingEnabled) CoralSoft else Cream,
+                            fontWeight = if (audioMixingEnabled) {
+                                FontWeight.SemiBold
+                            } else {
+                                FontWeight.Normal
+                            },
+                        )
+                        Text(
+                            "不主动抢占焦点；其他应用仍可能选择独占",
+                            color = Muted,
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                    }
+                },
+                leadingIcon = {
+                    Icon(
+                        Icons.Rounded.GraphicEq,
+                        contentDescription = null,
+                        tint = if (audioMixingEnabled) Coral else Muted,
+                    )
+                },
+                trailingIcon = {
+                    Switch(
+                        checked = audioMixingEnabled,
+                        onCheckedChange = null,
+                        modifier = Modifier.clearAndSetSemantics {},
+                    )
+                },
+                onClick = { onAudioMixingChange(!audioMixingEnabled) },
+            )
         }
     }
 }
@@ -1622,17 +1935,43 @@ private val PlaybackMode.icon: androidx.compose.ui.graphics.vector.ImageVector
         PlaybackMode.REVERSE -> Icons.Rounded.SwapVert
     }
 
+private val PlaybackQueueSource.displayLabel: String
+    get() = when (type) {
+        PlaybackQueueSourceType.LIBRARY -> name
+        PlaybackQueueSourceType.PLAYLIST -> "来自歌单：$name"
+    }
+
+private fun PlaybackUiState.matchesVisibleQueue(
+    source: PlaybackQueueSource,
+    songs: List<Song>,
+): Boolean {
+    val sourceMatches = when (source.type) {
+        PlaybackQueueSourceType.LIBRARY -> queueSource == source
+        PlaybackQueueSourceType.PLAYLIST ->
+            queueSource?.type == PlaybackQueueSourceType.PLAYLIST &&
+                queueSource.playlistId == source.playlistId
+    }
+    return sourceMatches &&
+        queueItems.size == songs.size &&
+        queueItems.indices.all { index -> queueItems[index].mediaId == songs[index].id }
+}
+
 @Composable
 private fun PlayerTab(
     label: String,
     icon: androidx.compose.ui.graphics.vector.ImageVector,
     selected: Boolean,
+    modifier: Modifier = Modifier,
     onClick: () -> Unit,
 ) {
     Row(
-        modifier = Modifier
+        modifier = modifier
             .background(if (selected) CardSurface else Color.Transparent, RoundedCornerShape(15.dp))
-            .clickable(onClick = onClick)
+            .selectable(
+                selected = selected,
+                role = Role.Tab,
+                onClick = onClick,
+            )
             .heightIn(min = 48.dp)
             .padding(horizontal = 15.dp, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
@@ -2415,7 +2754,7 @@ private fun VinylRecord(
 }
 
 @Composable
-private fun AlbumArtwork(
+internal fun AlbumArtwork(
     uri: Uri?,
     title: String,
     size: androidx.compose.ui.unit.Dp,

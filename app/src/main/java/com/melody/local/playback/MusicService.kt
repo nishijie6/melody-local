@@ -6,8 +6,13 @@ import android.media.AudioPlaybackConfiguration
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import androidx.annotation.OptIn
 import androidx.core.content.edit
+import androidx.core.net.toUri
+import com.melody.local.data.PlaylistDatabase
+import com.melody.local.data.RoomSongMetadataStore
+import com.melody.local.data.SongMetadataOverride
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.common.MediaMetadata
@@ -32,6 +37,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.concurrent.atomic.AtomicLong
@@ -44,8 +50,15 @@ class MusicService : MediaSessionService() {
     private lateinit var lyricsNotificationProvider: LyricsMediaNotificationProvider
     private lateinit var systemLyricsSettings: SystemLyricsSettings
     private var systemUiMetadataBackup: SystemUiMetadataBackup? = null
-    private val modeScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val playbackModeRequestId = AtomicLong()
+    private var songMetadata = emptyMap<Long, SongMetadataOverride>()
+    private var lastMetadataAppliedQueueGeneration: Long? = null
+    private var indexedQueueGeneration: Long? = null
+    private var indexedQueueSize = -1
+    private var queueIndicesBySongId = emptyMap<Long, List<Int>>()
+    private var queueContentRevision = 0L
+    private var queueContentRevisionGeneration: Long? = null
     private val mainHandler = Handler(Looper.getMainLooper())
     private val audioManager by lazy {
         getSystemService(Context.AUDIO_SERVICE) as AudioManager
@@ -62,6 +75,7 @@ class MusicService : MediaSessionService() {
         override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
             val player = mediaSession?.player ?: return
             if (
+                !audioMixingEnabled &&
                 !playWhenReady &&
                 reason == Player.PLAY_WHEN_READY_CHANGE_REASON_AUDIO_FOCUS_LOSS
             ) {
@@ -72,6 +86,12 @@ class MusicService : MediaSessionService() {
         }
 
         override fun onEvents(player: Player, events: Player.Events) {
+            if (events.contains(Player.EVENT_TIMELINE_CHANGED)) {
+                val queueGeneration = player.queueGenerationOrNull()
+                if (queueGeneration == null || queueGeneration != lastMetadataAppliedQueueGeneration) {
+                    applySavedSongMetadata(player)
+                }
+            }
             if (
                 resumeAfterCompetingPlayback &&
                 (
@@ -87,7 +107,12 @@ class MusicService : MediaSessionService() {
     private val preferences by lazy {
         getSharedPreferences(PLAYBACK_PREFERENCES, Context.MODE_PRIVATE)
     }
+    private val playbackAudioAttributes = AudioAttributes.Builder()
+        .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
+        .setUsage(C.USAGE_MEDIA)
+        .build()
     private var playbackMode: PlaybackMode = PlaybackMode.SEQUENTIAL
+    private var audioMixingEnabled = false
 
     private val sessionCallback = object : MediaSession.Callback {
         override fun onConnect(
@@ -99,6 +124,7 @@ class MusicService : MediaSessionService() {
             return MediaSession.ConnectionResult.accept(
                 result.availableSessionCommands.buildUpon()
                     .add(SET_PLAYBACK_MODE_COMMAND)
+                    .add(SET_AUDIO_MIXING_COMMAND)
                     .build(),
                 result.availablePlayerCommands,
             )
@@ -110,14 +136,25 @@ class MusicService : MediaSessionService() {
             customCommand: SessionCommand,
             args: Bundle,
         ): ListenableFuture<SessionResult> {
-            if (customCommand.customAction != ACTION_SET_PLAYBACK_MODE) {
-                return super.onCustomCommand(session, controller, customCommand, args)
+            return when (customCommand.customAction) {
+                ACTION_SET_PLAYBACK_MODE -> {
+                    val requestedMode = args.playbackModeOrNull()
+                        ?: return Futures.immediateFuture(
+                            SessionResult(SessionError.ERROR_BAD_VALUE)
+                        )
+                    applyPlaybackMode(session.player as ExoPlayer, requestedMode)
+                }
+
+                ACTION_SET_AUDIO_MIXING -> {
+                    val enabled = args.audioMixingEnabledOrNull()
+                        ?: return Futures.immediateFuture(
+                            SessionResult(SessionError.ERROR_BAD_VALUE)
+                        )
+                    applyAudioMixing(session.player as ExoPlayer, enabled)
+                }
+
+                else -> super.onCustomCommand(session, controller, customCommand, args)
             }
-            val requestedMode = args.playbackModeOrNull()
-                ?: return Futures.immediateFuture(
-                    SessionResult(SessionError.ERROR_BAD_VALUE)
-                )
-            return applyPlaybackMode(session.player as ExoPlayer, requestedMode)
         }
     }
 
@@ -126,12 +163,9 @@ class MusicService : MediaSessionService() {
         playbackMode = preferences.getString(ARG_PLAYBACK_MODE, null)
             ?.let { stored -> runCatching { PlaybackMode.valueOf(stored) }.getOrNull() }
             ?: PlaybackMode.SEQUENTIAL
-        val audioAttributes = AudioAttributes.Builder()
-            .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
-            .setUsage(C.USAGE_MEDIA)
-            .build()
+        audioMixingEnabled = preferences.getBoolean(ARG_AUDIO_MIXING_ENABLED, false)
         val player = ExoPlayer.Builder(this)
-            .setAudioAttributes(audioAttributes, true)
+            .setAudioAttributes(playbackAudioAttributes, !audioMixingEnabled)
             .setHandleAudioBecomingNoisy(true)
             .build()
         player.addListener(playerListener)
@@ -154,6 +188,30 @@ class MusicService : MediaSessionService() {
             }
         }.also { it.start() }
         audioManager.registerAudioPlaybackCallback(playbackActivityCallback, mainHandler)
+        // Observe committed state in the service, so finishing an edit does not require a live UI
+        // controller. Room runs its queries off the main thread and invalidates after each commit.
+        serviceScope.launch {
+            try {
+                RoomSongMetadataStore(
+                    PlaylistDatabase.getInstance(this@MusicService).songStateDao()
+                ).observeAll()
+                    .collect { overrides ->
+                        val previousMetadata = songMetadata
+                        val changedSongIds = withContext(Dispatchers.Default) {
+                            (previousMetadata.keys + overrides.keys)
+                                .filterTo(mutableSetOf()) { songId ->
+                                    previousMetadata[songId] != overrides[songId]
+                                }
+                        }
+                        songMetadata = overrides
+                        applySavedSongMetadata(player, changedSongIds)
+                    }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                Log.w("MusicService", "Unable to observe saved song metadata", error)
+            }
+        }
     }
 
     override fun onGetSession(
@@ -174,7 +232,7 @@ class MusicService : MediaSessionService() {
         playbackModeRequestId.incrementAndGet()
         systemLyricsCoordinator?.close()
         systemLyricsCoordinator = null
-        modeScope.cancel()
+        serviceScope.cancel()
         cancelInterruptedPlaybackResume()
         audioManager.unregisterAudioPlaybackCallback(playbackActivityCallback)
         mediaSession?.run {
@@ -188,6 +246,10 @@ class MusicService : MediaSessionService() {
     }
 
     private fun rememberInterruptedPlayback(player: Player) {
+        if (audioMixingEnabled) {
+            cancelInterruptedPlaybackResume()
+            return
+        }
         val mediaId = player.currentMediaItem?.mediaId
         if (
             mediaId == null ||
@@ -213,6 +275,7 @@ class MusicService : MediaSessionService() {
     private fun resumeAfterCompetingPlaybackEnds() {
         val player = mediaSession?.player
         if (
+            audioMixingEnabled ||
             !resumeAfterCompetingPlayback ||
             player == null ||
             player.currentMediaItem?.mediaId != interruptedMediaId ||
@@ -233,6 +296,71 @@ class MusicService : MediaSessionService() {
         interruptedMediaId = null
     }
 
+    private fun applySavedSongMetadata(
+        player: Player,
+        changedSongIds: Set<Long>? = null,
+    ) {
+        lastMetadataAppliedQueueGeneration = player.queueGenerationOrNull()
+        ensureQueueIndex(player)
+        var changed = false
+        val nextQueueContentRevision = queueContentRevision + 1L
+        val targetSongIds = changedSongIds ?: queueIndicesBySongId.keys
+        for (songId in targetSongIds) {
+            val saved = songMetadata[songId] ?: continue
+            for (index in queueIndicesBySongId[songId].orEmpty()) {
+                val item = player.getMediaItemAt(index)
+                val metadata = item.mediaMetadata
+                val savedArtworkUri = saved.artworkPath?.toUri()
+                if (metadata.title?.toString() == saved.title &&
+                    metadata.artist?.toString() == saved.artist &&
+                    metadata.albumTitle?.toString() == saved.album &&
+                    (savedArtworkUri == null || metadata.artworkUri == savedArtworkUri)
+                ) continue
+                val updatedBuilder = metadata.buildUpon()
+                    .setTitle(saved.title)
+                    .setArtist(saved.artist)
+                    .setAlbumTitle(saved.album)
+                    .setExtras(
+                        Bundle(metadata.extras ?: Bundle.EMPTY).apply {
+                            putLong(EXTRA_QUEUE_CONTENT_REVISION, nextQueueContentRevision)
+                        }
+                    )
+                savedArtworkUri?.let(updatedBuilder::setArtworkUri)
+                val updated = updatedBuilder.build()
+                // Preserve the source URI, position, playWhenReady and shuffle/repeat traversal.
+                player.replaceMediaItem(index, item.buildUpon().setMediaMetadata(updated).build())
+                changed = true
+            }
+        }
+        if (changed) {
+            queueContentRevision = nextQueueContentRevision
+            queueContentRevisionGeneration = player.queueGenerationOrNull()
+            mediaSession?.let(::updateSessionExtras)
+            updateSystemUiLyricMetadata(player, systemLyricSnapshot)
+            mediaSession?.takeIf { player.currentMediaItem != null }?.let {
+                onUpdateNotification(it, isPlaybackOngoing())
+            }
+        }
+    }
+
+    private fun ensureQueueIndex(player: Player) {
+        val generation = player.queueGenerationOrNull()
+        if (generation == indexedQueueGeneration && player.mediaItemCount == indexedQueueSize) return
+        val mutableIndices = mutableMapOf<Long, MutableList<Int>>()
+        for (index in 0 until player.mediaItemCount) {
+            val songId = player.getMediaItemAt(index).mediaId.toLongOrNull() ?: continue
+            mutableIndices.getOrPut(songId, ::mutableListOf) += index
+        }
+        queueIndicesBySongId = mutableIndices
+        indexedQueueGeneration = generation
+        indexedQueueSize = player.mediaItemCount
+    }
+
+    private fun Player.queueGenerationOrNull(): Long? =
+        currentMediaItem?.mediaMetadata?.extras
+            ?.takeIf { it.containsKey(EXTRA_QUEUE_GENERATION) }
+            ?.getLong(EXTRA_QUEUE_GENERATION)
+
     private fun applyPlaybackMode(
         player: ExoPlayer,
         mode: PlaybackMode,
@@ -251,7 +379,7 @@ class MusicService : MediaSessionService() {
 
         val itemCount = player.mediaItemCount
         val result = SettableFuture.create<SessionResult>()
-        modeScope.launch {
+        serviceScope.launch {
             try {
                 // DefaultShuffleOrder builds two O(n) arrays. Generate them off the UI thread
                 // so switching a large local library does not freeze controls or vinyl motion.
@@ -296,9 +424,37 @@ class MusicService : MediaSessionService() {
         mediaSession?.let(::updateSessionExtras)
     }
 
+    private fun applyAudioMixing(
+        player: ExoPlayer,
+        enabled: Boolean,
+    ): ListenableFuture<SessionResult> {
+        if (audioMixingEnabled == enabled) {
+            return Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
+        }
+        val resumeInterruptedPlayback = enabled &&
+            resumeAfterCompetingPlayback &&
+            player.currentMediaItem?.mediaId == interruptedMediaId &&
+            !player.playWhenReady &&
+            player.playbackState != Player.STATE_IDLE &&
+            player.playbackState != Player.STATE_ENDED
+
+        audioMixingEnabled = enabled
+        if (enabled) cancelInterruptedPlaybackResume()
+        player.setAudioAttributes(playbackAudioAttributes, !enabled)
+        preferences.edit { putBoolean(ARG_AUDIO_MIXING_ENABLED, enabled) }
+        mediaSession?.let(::updateSessionExtras)
+        if (resumeInterruptedPlayback) player.play()
+        return Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
+    }
+
     private fun updateSessionExtras(session: MediaSession) {
         session.setSessionExtras(
             playbackModeBundle(playbackMode).apply {
+                putBoolean(ARG_AUDIO_MIXING_ENABLED, audioMixingEnabled)
+                putLong(EXTRA_QUEUE_CONTENT_REVISION, queueContentRevision)
+                queueContentRevisionGeneration?.let {
+                    putLong(EXTRA_QUEUE_GENERATION, it)
+                }
                 putString(
                     SystemLyricsSessionContract.EXTRA_CURRENT_LINE,
                     systemLyricSnapshot.currentLine,

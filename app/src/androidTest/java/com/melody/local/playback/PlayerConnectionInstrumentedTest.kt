@@ -18,6 +18,8 @@ import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.melody.local.data.Song
+import com.melody.local.data.PlaylistDatabase
+import com.melody.local.data.SongOverrideEntity
 import com.melody.local.lyrics.LyricsRepository
 import com.melody.local.systemlyrics.SystemLyricsSettings
 import kotlinx.coroutines.runBlocking
@@ -31,6 +33,7 @@ import org.junit.runner.RunWith
 import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 
@@ -185,7 +188,86 @@ class PlayerConnectionInstrumentedTest {
     }
 
     @Test
+    fun editedMetadataRefreshesCurrentAndQueuedSongsWithoutRestartingPlayback() = runBlocking {
+        val dao = PlaylistDatabase.getInstance(context).songStateDao()
+        val currentId = 701L
+        val nextId = 702L
+        val previousCurrent = dao.getOverride(currentId)
+        val previousNext = dao.getOverride(nextId)
+        val lyrics = LyricsRepository(context)
+        val settings = SystemLyricsSettings(context)
+        val previousSetting = settings.notificationLyricsEnabled
+        settings.notificationLyricsEnabled = true
+        lyrics.save(currentId, "[00:00.00]Visible lyric")
+        val future = MediaController.Builder(
+            context, SessionToken(context, ComponentName(context, MusicService::class.java)),
+        ).buildAsync()
+        val observer = future.get(10, TimeUnit.SECONDS)
+        try {
+            val songs = listOf(
+                song(currentId, "Original", "Artist", "Album", Uri.parse("content://art/original")),
+                song(nextId, "Next", "Artist", "Album", null),
+            )
+            onMain {
+                connection.setPlaybackMode(PlaybackMode.REVERSE)
+                connection.playQueue(songs, 0)
+            }
+            waitUntil { connection.state.value.mediaId == currentId && connection.state.value.isPlaying }
+            onMain { connection.seekTo(3000) }
+            waitUntil { connection.state.value.positionMs >= 3000 }
+            val before = readController(observer) { currentPosition }
+            dao.upsertOverride(SongOverrideEntity(nextId, "Edited next", "Artist 2", "Album 2", null))
+            waitUntil {
+                connection.state.value.title == "Original" &&
+                    connection.state.value.queueItems.map { it.title } ==
+                    listOf("Original", "Edited next") &&
+                    readController(observer) { getMediaItemAt(1).mediaMetadata.title.toString() } == "Edited next"
+            }
+
+            dao.upsertOverride(SongOverrideEntity(currentId, "Edited", "New artist", "New album", null))
+            waitUntil {
+                connection.state.value.title == "Edited" &&
+                    connection.state.value.queueItems.map { it.title } ==
+                    listOf("Edited", "Edited next") &&
+                    readController(observer) { getMediaItemAt(1).mediaMetadata.title.toString() } == "Edited next"
+            }
+            assertEquals(currentId, connection.state.value.mediaId)
+            assertEquals("New artist", connection.state.value.artist)
+            assertEquals("New album", connection.state.value.album)
+            assertEquals("content://art/original", connection.state.value.artworkUri.toString())
+            assertEquals(PlaybackMode.REVERSE, connection.state.value.playbackMode)
+            assertTrue(connection.state.value.isPlaying)
+            assertTrue(readController(observer) { currentPosition } >= before)
+            assertEquals(2, readController(observer) { mediaItemCount })
+            assertEquals(listOf(currentId, nextId), connection.state.value.queueItems.map { it.mediaId })
+            waitUntil {
+                readController(observer) { currentMediaItem!!.mediaMetadata.subtitle.toString() } ==
+                    "Edited · New artist"
+            }
+            assertEquals("Visible lyric", readController(observer) { currentMediaItem!!.mediaMetadata.displayTitle.toString() })
+            onMain { connection.togglePlayPause() }
+            waitUntil { !connection.state.value.isPlaying && !readController(observer) { playWhenReady } }
+            val pausedPosition = readController(observer) { currentPosition }
+            dao.upsertOverride(SongOverrideEntity(currentId, "Edited paused", "New artist", "New album", null))
+            waitUntil { connection.state.value.title == "Edited paused" }
+            val positionAfterMetadataUpdate = readController(observer) { currentPosition }
+            assertTrue(
+                "paused position moved unexpectedly: $pausedPosition -> $positionAfterMetadataUpdate",
+                positionAfterMetadataUpdate in pausedPosition..(pausedPosition + 250L),
+            )
+            assertTrue(!connection.state.value.isPlaying)
+        } finally {
+            onMain { MediaController.releaseFuture(future) }
+            lyrics.delete(currentId)
+            settings.notificationLyricsEnabled = previousSetting
+            if (previousCurrent == null) dao.deleteOverride(currentId) else dao.upsertOverride(previousCurrent)
+            if (previousNext == null) dao.deleteOverride(nextId) else dao.upsertOverride(previousNext)
+        }
+    }
+
+    @Test
     fun resumesAfterCompetingPlaybackReleasesPermanentAudioFocus() {
+        setAudioMixing(false)
         val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
         val competingFocusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
             .setAudioAttributes(
@@ -232,12 +314,225 @@ class PlayerConnectionInstrumentedTest {
         }
     }
 
+    @Test
+    fun audioMixingKeepsThisPlayerAndTheCompetingSourcePlaying() {
+        val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        val competingFocusChanges = CopyOnWriteArrayList<Int>()
+        val competingFocusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+            .setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                    .build()
+            )
+            .setOnAudioFocusChangeListener(
+                { change -> competingFocusChanges += change },
+                Handler(Looper.getMainLooper()),
+            )
+            .build()
+        val competingPlayer = MediaPlayer().apply {
+            setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                    .build()
+            )
+            setDataSource(audioFile.absolutePath)
+            isLooping = true
+            prepare()
+        }
+
+        try {
+            assertEquals(
+                AudioManager.AUDIOFOCUS_REQUEST_GRANTED,
+                audioManager.requestAudioFocus(competingFocusRequest),
+            )
+            competingPlayer.start()
+            assertTrue(competingPlayer.isPlaying)
+
+            setAudioMixing(true)
+            onMain { connection.playQueue(testSongs().take(1), startIndex = 0) }
+            waitUntil {
+                connection.state.value.audioMixingEnabled &&
+                    connection.state.value.isPlaying
+            }
+            waitUntil { audioManager.activePlaybackConfigurations.size >= 2 }
+
+            assertTrue(competingPlayer.isPlaying)
+            assertTrue(connection.state.value.isPlaying)
+            assertTrue(
+                "mixing playback unexpectedly took audio focus: $competingFocusChanges",
+                competingFocusChanges.none { it < 0 },
+            )
+        } finally {
+            onMain { connection.stop() }
+            runCatching { competingPlayer.stop() }
+            runCatching { competingPlayer.release() }
+            audioManager.abandonAudioFocusRequest(competingFocusRequest)
+            setAudioMixing(false)
+        }
+    }
+
+    @Test
+    fun enablingAudioMixingResumesTheFocusInterruptedTrack() {
+        setAudioMixing(false)
+        val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        val competingFocusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+            .setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                    .build()
+            )
+            .setOnAudioFocusChangeListener({}, Handler(Looper.getMainLooper()))
+            .build()
+        val competingPlayer = MediaPlayer().apply {
+            setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                    .build()
+            )
+            setDataSource(audioFile.absolutePath)
+            isLooping = true
+            prepare()
+        }
+
+        try {
+            onMain { connection.playQueue(testSongs().take(1), startIndex = 0) }
+            waitUntil { connection.state.value.isPlaying }
+            assertEquals(
+                AudioManager.AUDIOFOCUS_REQUEST_GRANTED,
+                audioManager.requestAudioFocus(competingFocusRequest),
+            )
+            competingPlayer.start()
+            waitUntil { !connection.state.value.isPlaying }
+            val interruptedPositionMs = connection.state.value.positionMs
+
+            setAudioMixing(true)
+            waitUntil {
+                connection.state.value.audioMixingEnabled &&
+                    connection.state.value.isPlaying &&
+                    connection.state.value.mediaId == 1L
+            }
+            waitUntil { audioManager.activePlaybackConfigurations.size >= 2 }
+
+            assertTrue(competingPlayer.isPlaying)
+            assertTrue(connection.state.value.positionMs >= interruptedPositionMs)
+        } finally {
+            onMain { connection.stop() }
+            runCatching { competingPlayer.stop() }
+            runCatching { competingPlayer.release() }
+            audioManager.abandonAudioFocusRequest(competingFocusRequest)
+            setAudioMixing(false)
+        }
+    }
+
+    @Test
+    fun enablingAudioMixingAfterManualPauseKeepsTheTrackPaused() {
+        setAudioMixing(false)
+        try {
+            onMain { connection.playQueue(testSongs().take(1), startIndex = 0) }
+            waitUntil { connection.state.value.isPlaying }
+            onMain { connection.togglePlayPause() }
+            waitUntil { !connection.state.value.isPlaying }
+            val pausedPosition = connection.state.value.positionMs
+
+            setAudioMixing(true)
+            SystemClock.sleep(750L)
+
+            assertTrue(connection.state.value.audioMixingEnabled)
+            assertTrue(!connection.state.value.isPlaying)
+            assertEquals(1L, connection.state.value.mediaId)
+            assertTrue(connection.state.value.positionMs in pausedPosition..(pausedPosition + 250L))
+        } finally {
+            onMain { connection.stop() }
+            setAudioMixing(false)
+        }
+    }
+
+    @Test
+    fun hotAudioMixingTogglePreservesQueueAndRestoresStandardFocusBehavior() {
+        setAudioMixing(false)
+        val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        val competingFocusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+            .setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                    .build()
+            )
+            .setOnAudioFocusChangeListener({}, Handler(Looper.getMainLooper()))
+            .build()
+        val competingPlayer = MediaPlayer().apply {
+            setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                    .build()
+            )
+            setDataSource(audioFile.absolutePath)
+            isLooping = true
+            prepare()
+        }
+
+        try {
+            onMain {
+                connection.setPlaybackMode(PlaybackMode.REVERSE)
+                connection.playQueue(testSongs(), startIndex = 1)
+            }
+            waitUntil {
+                connection.state.value.isPlaying &&
+                    connection.state.value.mediaId == 2L &&
+                    connection.state.value.playbackMode == PlaybackMode.REVERSE
+            }
+            val initialPosition = connection.state.value.positionMs
+            val initialQueue = connection.state.value.queueItems.map { it.mediaId }
+
+            setAudioMixing(true)
+            waitUntil {
+                connection.state.value.audioMixingEnabled && connection.state.value.isPlaying
+            }
+            setAudioMixing(false)
+            waitUntil {
+                !connection.state.value.audioMixingEnabled && connection.state.value.isPlaying
+            }
+
+            assertEquals(2L, connection.state.value.mediaId)
+            assertEquals(initialQueue, connection.state.value.queueItems.map { it.mediaId })
+            assertEquals(PlaybackMode.REVERSE, connection.state.value.playbackMode)
+            assertTrue(connection.state.value.positionMs >= initialPosition)
+
+            assertEquals(
+                AudioManager.AUDIOFOCUS_REQUEST_GRANTED,
+                audioManager.requestAudioFocus(competingFocusRequest),
+            )
+            competingPlayer.start()
+            waitUntil { !connection.state.value.isPlaying }
+            val interruptedPosition = connection.state.value.positionMs
+
+            competingPlayer.stop()
+            audioManager.abandonAudioFocusRequest(competingFocusRequest)
+            waitUntil(timeoutMs = 5_000L) { connection.state.value.isPlaying }
+
+            assertEquals(2L, connection.state.value.mediaId)
+            assertEquals(initialQueue, connection.state.value.queueItems.map { it.mediaId })
+            assertEquals(PlaybackMode.REVERSE, connection.state.value.playbackMode)
+            assertTrue(connection.state.value.positionMs >= interruptedPosition)
+        } finally {
+            runCatching { competingPlayer.release() }
+            audioManager.abandonAudioFocusRequest(competingFocusRequest)
+            onMain { connection.setPlaybackMode(PlaybackMode.SEQUENTIAL) }
+            setAudioMixing(false)
+        }
+    }
+
     private fun testSongs(): List<Song> = listOf(
         song(1L, "First", "Artist 1", "Album 1", Uri.parse("content://art/1")),
         song(2L, "Second", "Artist 2", "Album 2", Uri.parse("content://art/2")),
     )
 
-    private fun song(id: Long, title: String, artist: String, album: String, artwork: Uri) = Song(
+    private fun song(id: Long, title: String, artist: String, album: String, artwork: Uri?) = Song(
         id = id,
         title = title,
         artist = artist,
@@ -279,6 +574,38 @@ class PlayerConnectionInstrumentedTest {
                 SystemClock.sleep(50L)
             }
             throw AssertionError("service did not publish playback mode $expected")
+        } finally {
+            InstrumentationRegistry.getInstrumentation().runOnMainSync {
+                MediaController.releaseFuture(future)
+            }
+        }
+    }
+
+    private fun setAudioMixing(enabled: Boolean) {
+        onMain {
+            connection.setAudioMixingEnabled(!enabled)
+            connection.setAudioMixingEnabled(enabled)
+        }
+        waitForServiceAudioMixing(enabled)
+    }
+
+    private fun waitForServiceAudioMixing(expected: Boolean) {
+        val future = MediaController.Builder(
+            context,
+            SessionToken(context, ComponentName(context, MusicService::class.java)),
+        ).buildAsync()
+        val observer = future.get(10, TimeUnit.SECONDS)
+        try {
+            val deadline = SystemClock.elapsedRealtime() + 10_000L
+            while (SystemClock.elapsedRealtime() < deadline) {
+                val observed = AtomicReference<Boolean?>()
+                InstrumentationRegistry.getInstrumentation().runOnMainSync {
+                    observed.set(observer.sessionExtras.audioMixingEnabledOrNull())
+                }
+                if (observed.get() == expected) return
+                SystemClock.sleep(50L)
+            }
+            throw AssertionError("service did not publish audio mixing=$expected")
         } finally {
             InstrumentationRegistry.getInstrumentation().runOnMainSync {
                 MediaController.releaseFuture(future)

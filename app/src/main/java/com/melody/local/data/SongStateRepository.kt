@@ -1,5 +1,9 @@
 package com.melody.local.data
 
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.map
+
 data class SongMetadataOverride(
     val songId: Long,
     val title: String,
@@ -10,6 +14,7 @@ data class SongMetadataOverride(
 
 interface SongMetadataStore {
     suspend fun getAll(): Map<Long, SongMetadataOverride>
+    fun observeAll(): Flow<Map<Long, SongMetadataOverride>> = flow { emit(getAll()) }
     suspend fun put(value: SongMetadataOverride)
     suspend fun remap(oldSongId: Long, newSongId: Long)
     suspend fun delete(songId: Long)
@@ -21,6 +26,11 @@ class RoomSongMetadataStore(
     override suspend fun getAll(): Map<Long, SongMetadataOverride> =
         dao.getAllOverrides().associate { entity ->
             entity.songId to entity.asExternal()
+        }
+
+    override fun observeAll(): Flow<Map<Long, SongMetadataOverride>> =
+        dao.observeOverrides().map { entities ->
+            entities.associate { entity -> entity.songId to entity.asExternal() }
         }
 
     override suspend fun put(value: SongMetadataOverride) {

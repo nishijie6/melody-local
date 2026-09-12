@@ -17,6 +17,8 @@ import com.melody.local.data.PlaylistSummary
 import com.melody.local.data.RoomMoveJournalStore
 import com.melody.local.data.RoomSongMetadataStore
 import com.melody.local.data.Song
+import com.melody.local.data.SongMetadataEditor
+import com.melody.local.data.LocalSongMetadataEditor
 import com.melody.local.lyrics.LyricsStore
 import com.melody.local.lyrics.ParsedLyrics
 import com.melody.local.lyrics.LyricsAutomationSettings
@@ -27,6 +29,7 @@ import com.melody.local.lyrics.LyricsResolverApi
 import com.melody.local.lyrics.discovery.RankedOnlineLyrics
 import com.melody.local.playback.PlayerConnection
 import com.melody.local.playback.PlaybackController
+import com.melody.local.playback.PlaybackQueueSource
 import com.melody.local.media.MediaAuthorizationRequest
 import com.melody.local.media.MediaOperationState
 import com.melody.local.media.MediaStoreSongRelocationCoordinator
@@ -124,6 +127,7 @@ class MainViewModel internal constructor(
     private val videoAudioExtractor: VideoAudioExtractor? = null,
     private val songRelocationCoordinator: SongRelocationCoordinator? = null,
     private val lyricsResolver: LyricsResolverApi? = null,
+    private val songMetadataEditor: SongMetadataEditor? = null,
 ) : AndroidViewModel(application) {
     private constructor(application: Application, services: ProductionServices) : this(
         application = application,
@@ -134,6 +138,7 @@ class MainViewModel internal constructor(
         videoAudioExtractor = services.videoExtractor,
         songRelocationCoordinator = services.relocation,
         lyricsResolver = services.lyricsResolver,
+        songMetadataEditor = services.songMetadataEditor,
     )
 
     constructor(application: Application) : this(application, ProductionServices(application))
@@ -145,6 +150,9 @@ class MainViewModel internal constructor(
 
     private val _isLoading = MutableStateFlow(false)
     val isLoading: StateFlow<Boolean> = _isLoading.asStateFlow()
+    private var libraryRefreshGeneration = 0L
+    private val songIdentityRefreshPending = AtomicBoolean(false)
+    private val songIdentityRefreshCanRelease = AtomicBoolean(false)
 
     private val _libraryError = MutableStateFlow<String?>(null)
     val libraryError: StateFlow<String?> = _libraryError.asStateFlow()
@@ -201,6 +209,14 @@ class MainViewModel internal constructor(
 
     private val _messages = MutableSharedFlow<String>(extraBufferCapacity = 4)
     val messages = _messages.asSharedFlow()
+
+    private val _songEditorDraft = MutableStateFlow<Song?>(null)
+    val songEditorDraft = _songEditorDraft.asStateFlow()
+    private val _songEditSaving = MutableStateFlow(false)
+    val songEditSaving = _songEditSaving.asStateFlow()
+    private val _songEditError = MutableStateFlow<String?>(null)
+    val songEditError = _songEditError.asStateFlow()
+    private var songMetadataRevision = 0L
 
     private val _videoImportDraft = MutableStateFlow<VideoImportDraft?>(null)
     val videoImportDraft: StateFlow<VideoImportDraft?> = _videoImportDraft.asStateFlow()
@@ -261,6 +277,8 @@ class MainViewModel internal constructor(
             // second destructive operation. The coordinator independently guards its journal;
             // this synchronous state is the UI-side half of the same invariant.
             relocationStartInFlight.set(true)
+            songIdentityRefreshPending.set(true)
+            songIdentityRefreshCanRelease.set(false)
             _playlistMoveState.value = MediaOperationState.Preparing("正在检查未完成的文件移动…")
             relocationJob = viewModelScope.launch {
                 try {
@@ -272,12 +290,15 @@ class MainViewModel internal constructor(
                         updateMoveState(
                             MediaOperationState.Failed(error.message ?: "无法恢复上次的文件移动")
                         )
+                        refreshSongsAfterRelocation()
                         null
                     }
                     if (recovered != null) {
                         handleRelocationStep(recovered)
                     } else if (_playlistMoveState.value is MediaOperationState.Preparing) {
                         _playlistMoveState.value = MediaOperationState.Idle
+                        songIdentityRefreshPending.set(false)
+                        songIdentityRefreshCanRelease.set(false)
                     }
                 } finally {
                     relocationStartInFlight.set(false)
@@ -288,11 +309,40 @@ class MainViewModel internal constructor(
 
     fun refreshSongs() {
         if (_isLoading.value) return
+        startSongRefresh(
+            releaseIdentityGateOnSuccess = songIdentityRefreshCanRelease.get(),
+        )
+    }
+
+    private fun refreshSongsAfterRelocation() {
+        songIdentityRefreshPending.set(true)
+        songIdentityRefreshCanRelease.set(true)
+        startSongRefresh(releaseIdentityGateOnSuccess = true)
+    }
+
+    private fun startSongRefresh(releaseIdentityGateOnSuccess: Boolean) {
+        val generation = ++libraryRefreshGeneration
+        _isLoading.value = true
+        _libraryError.value = null
         viewModelScope.launch {
-            _isLoading.value = true
-            _libraryError.value = null
-            runCatching { musicRepository.loadSongs() }
-                .onSuccess { _allSongs.value = it }
+            val result = runCatching {
+                var revision: Long
+                var songs: List<Song>
+                do {
+                    revision = songMetadataRevision
+                    songs = musicRepository.loadSongs()
+                } while (revision != songMetadataRevision)
+                songs
+            }
+            if (generation != libraryRefreshGeneration) return@launch
+            result
+                .onSuccess {
+                    _allSongs.value = it
+                    if (releaseIdentityGateOnSuccess && songIdentityRefreshCanRelease.get()) {
+                        songIdentityRefreshPending.set(false)
+                        songIdentityRefreshCanRelease.set(false)
+                    }
+                }
                 .onFailure {
                     _libraryError.value = "读取本地音乐失败，请检查音乐权限"
                 }
@@ -304,11 +354,72 @@ class MainViewModel internal constructor(
         _query.value = value
     }
 
+    fun openSongEditor(song: Song) {
+        if (_songEditSaving.value) return
+        if (_playlistMoveState.value.isBusy() || songIdentityRefreshPending.get()) {
+            _messages.tryEmit("请等待歌曲汇总和曲库刷新完成后再编辑信息")
+            return
+        }
+        val matches = _allSongs.value.filter { it.id == song.id }
+        if (matches.size != 1 || matches.single().contentUri != song.contentUri) {
+            _messages.tryEmit("无法唯一确认这首歌曲，请刷新曲库后重试")
+            return
+        }
+        _songEditError.value = null
+        _songEditorDraft.value = matches.single()
+    }
+
+    fun dismissSongEditor() {
+        if (_songEditSaving.value) return
+        _songEditorDraft.value = null
+        _songEditError.value = null
+    }
+
+    fun saveSongMetadata(
+        songId: Long,
+        title: String,
+        artist: String,
+        album: String,
+        replacementArtwork: Uri?,
+    ) {
+        val draft = _songEditorDraft.value?.takeIf { it.id == songId } ?: return
+        if (_songEditSaving.value) return
+        val editor = songMetadataEditor ?: return
+        val matches = _allSongs.value.filter { it.id == songId }
+        if (_playlistMoveState.value.isBusy() || songIdentityRefreshPending.get() || matches.size != 1 ||
+            matches.single().contentUri != draft.contentUri
+        ) {
+            _songEditError.value = "歌曲已变更或正在移动，请关闭编辑窗口并刷新曲库"
+            return
+        }
+        _songEditSaving.value = true
+        _songEditError.value = null
+        viewModelScope.launch {
+            try {
+                val updated = editor.save(draft, title, artist, album, replacementArtwork)
+                songMetadataRevision++
+                _allSongs.value = _allSongs.value.map { if (it.id == songId) updated else it }
+                _songEditorDraft.value = null
+                _messages.emit("歌曲信息已保存")
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                _songEditError.value = error.message ?: "歌曲信息保存失败，请重试"
+            } finally {
+                _songEditSaving.value = false
+            }
+        }
+    }
+
     fun updateSort(value: SongSort) {
         _sort.value = value
     }
 
-    fun playSongs(songs: List<Song>, startIndex: Int) = player.playQueue(songs, startIndex)
+    fun playSongs(
+        songs: List<Song>,
+        startIndex: Int,
+        source: PlaybackQueueSource = PlaybackQueueSource.library(),
+    ) = player.playQueue(songs, startIndex, source)
 
     fun selectPlaylist(playlistId: Long?) {
         selectedPlaylistId.value = playlistId
@@ -481,6 +592,10 @@ class MainViewModel internal constructor(
     }
 
     fun startPlaylistMove(folderName: String) {
+        if (_songEditSaving.value || _songEditorDraft.value != null) {
+            _messages.tryEmit("请先保存或关闭歌曲信息编辑窗口")
+            return
+        }
         val coordinator = songRelocationCoordinator ?: return
         if (_playlistMoveState.value.isBusy() ||
             !relocationStartInFlight.compareAndSet(false, true)
@@ -490,6 +605,8 @@ class MainViewModel internal constructor(
         }
         // Enter a busy state synchronously so two taps in the same UI frame cannot queue two
         // destructive operations before the first coroutine starts executing.
+        songIdentityRefreshPending.set(true)
+        songIdentityRefreshCanRelease.set(false)
         _playlistMoveState.value = MediaOperationState.Preparing("正在准备汇总歌单歌曲…")
         player.stop()
         relocationJob = viewModelScope.launch {
@@ -530,8 +647,10 @@ class MainViewModel internal constructor(
     fun cancelPlaylistMove() {
         val coordinator = songRelocationCoordinator ?: return
         viewModelScope.launch {
-            withContext(Dispatchers.IO) { coordinator.cancel(::updateMoveState) }
-            refreshSongs()
+            val state = withContext(Dispatchers.IO) { coordinator.cancel(::updateMoveState) }
+            if (state.isTerminal()) {
+                refreshSongsAfterRelocation()
+            }
         }
     }
 
@@ -842,6 +961,26 @@ class MainViewModel internal constructor(
     }
 
     private fun updateMoveState(state: MediaOperationState) {
+        when (state) {
+            is MediaOperationState.Preparing,
+            is MediaOperationState.Processing,
+            is MediaOperationState.AwaitingSystemAuthorization,
+            -> {
+                songIdentityRefreshPending.set(true)
+                songIdentityRefreshCanRelease.set(false)
+            }
+            is MediaOperationState.Completed,
+            is MediaOperationState.Cancelled,
+            -> {
+                songIdentityRefreshPending.set(true)
+                songIdentityRefreshCanRelease.set(true)
+            }
+            is MediaOperationState.Failed -> {
+                songIdentityRefreshPending.set(true)
+                songIdentityRefreshCanRelease.set(false)
+            }
+            MediaOperationState.Idle -> Unit
+        }
         _playlistMoveState.value = state
     }
 
@@ -851,7 +990,7 @@ class MainViewModel internal constructor(
             is RelocationStep.Finished -> {
                 when (val state = step.state) {
                     is MediaOperationState.Completed -> {
-                        refreshSongs()
+                        refreshSongsAfterRelocation()
                         val summary = state.summary
                         _messages.emit(
                             "汇总完成：移动 ${summary.moved} 首，跳过 ${summary.skipped} 首，" +
@@ -859,10 +998,13 @@ class MainViewModel internal constructor(
                         )
                     }
                     is MediaOperationState.Cancelled -> {
-                        refreshSongs()
+                        refreshSongsAfterRelocation()
                         _messages.emit("歌单歌曲汇总已取消，已完成部分会保留")
                     }
-                    is MediaOperationState.Failed -> _messages.emit(state.message)
+                    is MediaOperationState.Failed -> {
+                        refreshSongsAfterRelocation()
+                        _messages.emit(state.message)
+                    }
                     else -> Unit
                 }
             }
@@ -888,6 +1030,7 @@ class MainViewModel internal constructor(
 private class ProductionServices(application: Application) {
     private val database = PlaylistDatabase.getInstance(application)
     private val metadata = RoomSongMetadataStore(database.songStateDao())
+    val songMetadataEditor = LocalSongMetadataEditor(application, metadata)
     private val lyricsRuntime = AppLyricsRuntime.get(application)
     val playlists = PlaylistRepository(database.playlistDao())
     val lyrics = lyricsRuntime.repository
