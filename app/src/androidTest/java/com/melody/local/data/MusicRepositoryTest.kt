@@ -66,6 +66,8 @@ class MusicRepositoryTest {
                     "Custom artist",
                     "Custom album",
                     "file:///private/cover.jpg",
+                    playbackStartMs = 2_000L,
+                    playbackEndMs = 8_000L,
                 )
             )
             override suspend fun put(value: SongMetadataOverride) = Unit
@@ -75,7 +77,7 @@ class MusicRepositoryTest {
         val repository = MusicRepository(
             AudioMediaQuery { _, projection, _, _ ->
                 MatrixCursor(projection).apply {
-                    addRow(mediaRow(projection, 7L, "Store title", "Store artist", "Store album", 41L, 1_000L, 1, 1L, "external_primary"))
+                    addRow(mediaRow(projection, 7L, "Store title", "Store artist", "Store album", 41L, 10_000L, 1, 1L, "external_primary"))
                 }
             },
             metadata,
@@ -87,6 +89,9 @@ class MusicRepositoryTest {
         assertEquals("Custom artist", song.artist)
         assertEquals("Custom album", song.album)
         assertEquals("file:///private/cover.jpg", song.albumArtUri.toString())
+        assertEquals(2_000L, song.playbackStartMs)
+        assertEquals(8_000L, song.playbackEndMs)
+        assertEquals(6_000L, song.playbackDurationMs())
     }
 
     @Test

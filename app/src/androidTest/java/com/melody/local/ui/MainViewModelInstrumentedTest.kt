@@ -16,6 +16,7 @@ import com.melody.local.data.PlaylistStore
 import com.melody.local.data.PlaylistSummary
 import com.melody.local.data.Song
 import com.melody.local.data.SongMetadataEditor
+import com.melody.local.data.playbackDurationMs
 import com.melody.local.lyrics.LyricLine
 import com.melody.local.lyrics.LyricsAutomationPreferences
 import com.melody.local.lyrics.LyricsResolverApi
@@ -664,6 +665,37 @@ class MainViewModelInstrumentedTest {
         assertEquals(5000L, fixture.player.state.value.positionMs)
         assertEquals(0, fixture.player.stopCount)
         collection.cancel()
+        fixture.clear()
+    }
+
+    @Test
+    fun songEditValidatesAndPublishesPlaybackRange() = runBlocking {
+        var inputToEditor: Song? = null
+        val fixture = Fixture(
+            music = FakeMusicLibrary { listOf(song(1)) },
+            songEditor = SongMetadataEditor { original, title, artist, album, _ ->
+                inputToEditor = original
+                original.copy(title = title, artist = artist, album = album)
+            },
+        )
+        fixture.viewModel.refreshSongs()
+        waitUntil { fixture.viewModel.allSongs.value.size == 1 }
+        fixture.viewModel.openSongEditor(song(1))
+
+        fixture.viewModel.saveSongEdits(
+            songId = 1L,
+            title = "Edited",
+            artist = "Artist",
+            album = "Album",
+            replacementArtwork = null,
+            playbackStartMs = 12_000L,
+            playbackEndMs = 50_000L,
+        )
+        waitUntil { fixture.viewModel.songEditorDraft.value == null }
+
+        assertEquals(12_000L, inputToEditor?.playbackStartMs)
+        assertEquals(50_000L, inputToEditor?.playbackEndMs)
+        assertEquals(38_000L, fixture.viewModel.allSongs.value.single().playbackDurationMs())
         fixture.clear()
     }
 

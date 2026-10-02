@@ -17,6 +17,7 @@ import androidx.media3.session.SessionResult
 import androidx.media3.session.SessionToken
 import com.google.common.util.concurrent.ListenableFuture
 import com.melody.local.data.Song
+import com.melody.local.data.playbackRange
 import com.melody.local.systemlyrics.AudioOutputRoute
 import com.melody.local.systemlyrics.SystemLyricsSessionContract
 import kotlinx.coroutines.CoroutineScope
@@ -76,6 +77,8 @@ data class PlaybackUiState(
     val isPlaying: Boolean = false,
     val positionMs: Long = 0,
     val durationMs: Long = 0,
+    /** Offset of the clipped Media3 timeline in the original source file. */
+    val playbackStartMs: Long = 0L,
     val playbackMode: PlaybackMode = PlaybackMode.SEQUENTIAL,
     val audioMixingEnabled: Boolean = false,
     val lyricDelayMs: Long = 0L,
@@ -84,7 +87,9 @@ data class PlaybackUiState(
     val queueSource: PlaybackQueueSource? = null,
     val queueItems: List<PlaybackQueueItem> = emptyList(),
     val queueIndex: Int = -1,
-)
+) {
+    val sourcePositionMs: Long get() = (playbackStartMs + positionMs).coerceAtLeast(0L)
+}
 
 interface PlaybackController {
     val state: StateFlow<PlaybackUiState>
@@ -327,6 +332,9 @@ class PlayerConnection(context: Context) :
             isPlaying = player.isPlaying,
             positionMs = player.currentPosition.coerceAtLeast(0L),
             durationMs = player.safeDuration(),
+            playbackStartMs = player.currentMediaItem?.mediaMetadata?.extras
+                ?.playbackStartMsOrZero()
+                ?: 0L,
             playbackMode = currentPlaybackMode,
             audioMixingEnabled = currentAudioMixingEnabled,
             lyricDelayMs = currentLyricDelayMs,
@@ -498,17 +506,23 @@ class PlayerConnection(context: Context) :
         source: PlaybackQueueSource,
         queueGeneration: Long,
     ): MediaItem {
+        val playbackRange = playbackRange()
         val metadataBuilder = MediaMetadata.Builder()
             .setTitle(title)
             .setArtist(artist)
             .setAlbumTitle(album)
             .setIsPlayable(true)
-            .setExtras(source.asMediaMetadataExtras(queueGeneration))
+            .setExtras(
+                source.asMediaMetadataExtras(queueGeneration).apply {
+                    putPlaybackRange(playbackRange, durationMs)
+                }
+            )
         albumArtUri?.let(metadataBuilder::setArtworkUri)
         return MediaItem.Builder()
             .setMediaId(id.toString())
             .setUri(contentUri)
             .setMediaMetadata(metadataBuilder.build())
+            .setClippingConfiguration(playbackRange.asClippingConfiguration(durationMs))
             .build()
     }
 

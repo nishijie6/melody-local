@@ -13,8 +13,10 @@ import androidx.core.net.toUri
 import com.melody.local.data.PlaylistDatabase
 import com.melody.local.data.RoomSongMetadataStore
 import com.melody.local.data.SongMetadataOverride
+import com.melody.local.data.SongPlaybackRangeConstraints
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
+import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
@@ -303,6 +305,7 @@ class MusicService : MediaSessionService() {
         lastMetadataAppliedQueueGeneration = player.queueGenerationOrNull()
         ensureQueueIndex(player)
         var changed = false
+        val clippingReplacements = mutableMapOf<Int, MediaItem>()
         val nextQueueContentRevision = queueContentRevision + 1L
         val targetSongIds = changedSongIds ?: queueIndicesBySongId.keys
         for (songId in targetSongIds) {
@@ -311,11 +314,24 @@ class MusicService : MediaSessionService() {
                 val item = player.getMediaItemAt(index)
                 val metadata = item.mediaMetadata
                 val savedArtworkUri = saved.artworkPath?.toUri()
-                if (metadata.title?.toString() == saved.title &&
+                val sourceDurationMs = metadata.extras?.sourceDurationMsOrNull()
+                val playbackRange = sourceDurationMs?.let { durationMs ->
+                    SongPlaybackRangeConstraints.normalize(
+                        sourceDurationMs = durationMs,
+                        startMs = saved.playbackStartMs,
+                        endMs = saved.playbackEndMs,
+                    )
+                }
+                val clippingConfiguration = playbackRange?.let { range ->
+                    range.asClippingConfiguration(sourceDurationMs)
+                }
+                val metadataMatches = metadata.title?.toString() == saved.title &&
                     metadata.artist?.toString() == saved.artist &&
                     metadata.albumTitle?.toString() == saved.album &&
                     (savedArtworkUri == null || metadata.artworkUri == savedArtworkUri)
-                ) continue
+                val clippingMatches = clippingConfiguration == null ||
+                    item.clippingConfiguration == clippingConfiguration
+                if (metadataMatches && clippingMatches) continue
                 val updatedBuilder = metadata.buildUpon()
                     .setTitle(saved.title)
                     .setArtist(saved.artist)
@@ -323,16 +339,30 @@ class MusicService : MediaSessionService() {
                     .setExtras(
                         Bundle(metadata.extras ?: Bundle.EMPTY).apply {
                             putLong(EXTRA_QUEUE_CONTENT_REVISION, nextQueueContentRevision)
+                            if (playbackRange != null) {
+                                putPlaybackRange(playbackRange, sourceDurationMs)
+                            }
                         }
                     )
                 savedArtworkUri?.let(updatedBuilder::setArtworkUri)
                 val updated = updatedBuilder.build()
-                // Preserve the source URI, position, playWhenReady and shuffle/repeat traversal.
-                player.replaceMediaItem(index, item.buildUpon().setMediaMetadata(updated).build())
+                // Preserve the source URI, playWhenReady and shuffle/repeat traversal. A metadata-
+                // only edit keeps position; a current clipping edit restarts at its new beginning.
+                val itemBuilder = item.buildUpon().setMediaMetadata(updated)
+                clippingConfiguration?.let(itemBuilder::setClippingConfiguration)
+                val replacement = itemBuilder.build()
+                if (!clippingMatches) {
+                    clippingReplacements[index] = replacement
+                } else {
+                    player.replaceMediaItem(index, replacement)
+                }
                 changed = true
             }
         }
         if (changed) {
+            if (clippingReplacements.isNotEmpty()) {
+                rebuildQueueForClippingChanges(player, clippingReplacements)
+            }
             queueContentRevision = nextQueueContentRevision
             queueContentRevisionGeneration = player.queueGenerationOrNull()
             mediaSession?.let(::updateSessionExtras)
@@ -341,6 +371,25 @@ class MusicService : MediaSessionService() {
                 onUpdateNotification(it, isPlaybackOngoing())
             }
         }
+    }
+
+    private fun rebuildQueueForClippingChanges(
+        player: Player,
+        replacements: Map<Int, MediaItem>,
+    ) {
+        val currentIndex = player.currentMediaItemIndex
+        if (currentIndex !in 0 until player.mediaItemCount) return
+        val playWhenReady = player.playWhenReady
+        val positionMs = if (currentIndex in replacements) 0L else player.currentPosition
+        val mediaItems = List(player.mediaItemCount) { index ->
+            replacements[index] ?: player.getMediaItemAt(index)
+        }
+        // Even an unplayed item already has a MediaSource. Updating an unclipped progressive
+        // source cannot add a clipping wrapper, so rebuild for any changed range. Only editing
+        // the current range restarts playback; edits to other items retain the current position.
+        player.setMediaItems(mediaItems, currentIndex, positionMs)
+        player.prepare()
+        player.playWhenReady = playWhenReady
     }
 
     private fun ensureQueueIndex(player: Player) {

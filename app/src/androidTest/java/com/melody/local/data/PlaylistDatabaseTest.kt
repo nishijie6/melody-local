@@ -84,7 +84,17 @@ class PlaylistDatabaseTest {
     fun metadataAndMoveJournalArePersistedAndUpdated() = runBlocking {
         val metadata = RoomSongMetadataStore(database.songStateDao())
         val journal = RoomMoveJournalStore(database.songStateDao())
-        metadata.put(SongMetadataOverride(7L, "Title", "Artist", "Album", "file:///cover.jpg"))
+        metadata.put(
+            SongMetadataOverride(
+                7L,
+                "Title",
+                "Artist",
+                "Album",
+                "file:///cover.jpg",
+                playbackStartMs = 12_000L,
+                playbackEndMs = 90_000L,
+            )
+        )
         journal.create(
             MoveOperationRecord("op", "Music/音澜/歌单汇总/", MoveOperationStatus.PREPARING),
             listOf(
@@ -109,7 +119,10 @@ class PlaylistDatabaseTest {
             )
         )
 
-        assertEquals("Title", metadata.getAll().getValue(8L).title)
+        val remappedMetadata = metadata.getAll().getValue(8L)
+        assertEquals("Title", remappedMetadata.title)
+        assertEquals(12_000L, remappedMetadata.playbackStartMs)
+        assertEquals(90_000L, remappedMetadata.playbackEndMs)
         assertEquals(MoveItemStatus.COPIED, journal.items("op").single().status)
         assertEquals(
             "content://media/external_primary/audio/media/7",

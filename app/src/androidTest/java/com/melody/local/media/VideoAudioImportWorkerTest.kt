@@ -1609,6 +1609,8 @@ class VideoAudioImportWorkerTest {
                         artist = "Previous artist",
                         album = "Previous album",
                         artworkPath = artwork.toUri().toString(),
+                        playbackStartMs = 12_000L,
+                        playbackEndMs = 90_000L,
                     )
                     metadata.put(old)
                     ownedSongId = songId

@@ -4,6 +4,20 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
+### Fixed
+
+- Editing playback boundaries for an unplayed queue item now rebuilds its Media3 source as well, so newly added trimming changes the actual audio range while preserving the current song's position and play/pause state.
+
+### Added
+
+- Added non-destructive per-song playback trimming to the existing song editor. Users can retain a start/end range, use the live playback position as the new start, restore the full song, and see effective versus original duration in library and playlist rows.
+- Added Room 3→4 migration coverage plus playback, active-queue refresh, editor, metadata-recovery and range-validation regressions for saved song boundaries.
+
+### Changed
+
+- Media3 now receives each saved range through `MediaItem.ClippingConfiguration`, so background playback, notifications, all five queue modes and automatic next-song transitions use the same boundaries. Editing the active song reinstalls the same logical queue at the retained beginning without changing its source, play/pause state or mode.
+- Synchronized lyrics and lyric-timestamp editing continue to use the original audio timeline while player progress shows time relative to the retained clip.
+
 ## 1.5.0 - 2026-09-12
 
 ### Added

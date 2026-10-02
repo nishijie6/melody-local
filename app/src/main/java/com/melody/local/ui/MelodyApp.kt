@@ -162,6 +162,8 @@ import coil.compose.AsyncImage
 import com.melody.local.data.PlaylistSummary
 import com.melody.local.data.Song
 import com.melody.local.data.asDuration
+import com.melody.local.data.isPlaybackTrimmed
+import com.melody.local.data.playbackDurationMs
 import com.melody.local.lyrics.ParsedLyrics
 import com.melody.local.lyrics.LyricLayerType
 import com.melody.local.lyrics.StructuredLyricLayer
@@ -377,7 +379,8 @@ fun MelodyApp(
         lyricsEditorDraft?.let { draft ->
             LyricsEditorDialog(
                 initialText = draft.text,
-                playbackPositionMs = (playback.positionMs - playback.lyricDelayMs).coerceAtLeast(0L),
+                playbackPositionMs =
+                    (playback.sourcePositionMs - playback.lyricDelayMs).coerceAtLeast(0L),
                 onDismiss = viewModel::dismissLyricsEditor,
                 onSave = { text -> viewModel.saveEditedLyrics(draft.songId, text) },
             )
@@ -687,10 +690,13 @@ fun MelodyApp(
     songEditorDraft?.let { song ->
         SongMetadataEditorDialog(
             song = song,
+            currentSourcePositionMs = playback.sourcePositionMs.takeIf {
+                playback.mediaId == song.id
+            },
             saving = songEditSaving,
             error = songEditError,
             onDismiss = viewModel::dismissSongEditor,
-            onSave = viewModel::saveSongMetadata,
+            onSave = viewModel::saveSongEdits,
         )
     }
 
@@ -1073,8 +1079,13 @@ private fun SongRow(
                 )
             }
             Spacer(Modifier.height(3.dp))
+            val playbackDurationLabel = if (song.isPlaybackTrimmed()) {
+                "已裁剪 ${song.playbackDurationMs().asDuration()} / 原曲 ${song.durationMs.asDuration()}"
+            } else {
+                song.durationMs.asDuration()
+            }
             Text(
-                "${song.artist}  ·  ${song.durationMs.asDuration()}",
+                "${song.artist}  ·  $playbackDurationLabel",
                 color = Muted,
                 style = MaterialTheme.typography.bodyMedium,
                 maxLines = 1,
@@ -1087,7 +1098,7 @@ private fun SongRow(
             }
             DropdownMenu(expanded = menuExpanded, onDismissRequest = { menuExpanded = false }) {
                 DropdownMenuItem(
-                    text = { Text("编辑歌曲信息") },
+                    text = { Text("编辑歌曲与裁剪") },
                     leadingIcon = { Icon(Icons.Rounded.Edit, contentDescription = null) },
                     onClick = {
                         menuExpanded = false
@@ -1575,8 +1586,14 @@ private fun NowPlayingScreen(
             when (page) {
                 PlayerPage.LYRICS -> LyricsPanel(
                     lyricsState = lyricsState,
-                    positionMs = (playback.positionMs - playback.lyricDelayMs).coerceAtLeast(0L),
-                    onSeek = onSeek,
+                    positionMs =
+                        (playback.sourcePositionMs - playback.lyricDelayMs).coerceAtLeast(0L),
+                    onSeek = { sourcePositionMs ->
+                        onSeek(
+                            (sourcePositionMs - playback.playbackStartMs)
+                                .coerceIn(0L, playback.durationMs.coerceAtLeast(0L))
+                        )
+                    },
                     onImport = {
                         pendingLyricsSongId.value = playback.mediaId
                         importLauncher.launch(arrayOf("text/plain", "application/octet-stream"))

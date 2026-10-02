@@ -10,6 +10,8 @@ data class SongMetadataOverride(
     val artist: String,
     val album: String,
     val artworkPath: String?,
+    val playbackStartMs: Long = 0L,
+    val playbackEndMs: Long? = null,
 )
 
 interface SongMetadataStore {
@@ -51,6 +53,8 @@ class RoomSongMetadataStore(
         artist = artist,
         album = album,
         artworkPath = artworkPath,
+        playbackStartMs = playbackStartMs,
+        playbackEndMs = playbackEndMs,
     )
 
     private fun SongMetadataOverride.asEntity() = SongOverrideEntity(
@@ -59,6 +63,8 @@ class RoomSongMetadataStore(
         artist = artist,
         album = album,
         artworkPath = artworkPath,
+        playbackStartMs = playbackStartMs,
+        playbackEndMs = playbackEndMs,
     )
 }
 

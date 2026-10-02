@@ -8,6 +8,7 @@ import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performTextReplacement
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.melody.local.data.Song
@@ -31,7 +32,8 @@ class SongMetadataEditorDialogTest {
         val restoration = StateRestorationTester(compose)
         restoration.setContent {
             MaterialTheme {
-                SongMetadataEditorDialog(original, false, null, {}) { id, title, artist, album, _ ->
+                SongMetadataEditorDialog(original, null, false, null, {}) {
+                        id, title, artist, album, _, _, _ ->
                     savedId = id
                     savedFields = listOf(title, artist, album)
                 }
@@ -50,7 +52,11 @@ class SongMetadataEditorDialogTest {
 
     @Test fun emptyTitleCannotBeSaved() {
         compose.setContent {
-            MaterialTheme { SongMetadataEditorDialog(original, false, null, {}) { _, _, _, _, _ -> } }
+            MaterialTheme {
+                SongMetadataEditorDialog(original, null, false, null, {}) {
+                        _, _, _, _, _, _, _ ->
+                }
+            }
         }
         compose.onNodeWithTag("song-edit-title").performTextReplacement(" ")
         compose.onNodeWithTag("song-edit-save").assertIsNotEnabled()
@@ -58,10 +64,36 @@ class SongMetadataEditorDialogTest {
 
     @Test fun savingDisablesFieldsAndDismissal() {
         compose.setContent {
-            MaterialTheme { SongMetadataEditorDialog(original, true, null, {}) { _, _, _, _, _ -> } }
+            MaterialTheme {
+                SongMetadataEditorDialog(original, null, true, null, {}) {
+                        _, _, _, _, _, _, _ ->
+                }
+            }
         }
         compose.onNodeWithTag("song-edit-title").assertIsNotEnabled()
         compose.onNodeWithTag("song-edit-save").assertIsNotEnabled()
         compose.onNodeWithText("取消").assertIsNotEnabled()
+    }
+
+    @Test fun currentPlaybackPositionCanBecomeTheSavedTrimStart() {
+        var savedStartMs: Long? = null
+        var savedEndMs: Long? = -1L
+        compose.setContent {
+            MaterialTheme {
+                SongMetadataEditorDialog(original, 12_345L, false, null, {}) {
+                        _, _, _, _, _, startMs, endMs ->
+                    savedStartMs = startMs
+                    savedEndMs = endMs
+                }
+            }
+        }
+
+        compose.onNodeWithTag("song-edit-use-current-position").performScrollTo().performClick()
+        compose.onNodeWithTag("song-edit-save").performClick()
+
+        compose.runOnIdle {
+            assertEquals(12_345L, savedStartMs)
+            assertEquals(null, savedEndMs)
+        }
     }
 }

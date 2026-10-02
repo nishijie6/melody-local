@@ -19,6 +19,8 @@ import com.melody.local.data.RoomSongMetadataStore
 import com.melody.local.data.Song
 import com.melody.local.data.SongMetadataEditor
 import com.melody.local.data.LocalSongMetadataEditor
+import com.melody.local.data.SongPlaybackRangeConstraints
+import com.melody.local.data.persistedEndMs
 import com.melody.local.lyrics.LyricsStore
 import com.melody.local.lyrics.ParsedLyrics
 import com.melody.local.lyrics.LyricsAutomationSettings
@@ -383,6 +385,27 @@ class MainViewModel internal constructor(
         replacementArtwork: Uri?,
     ) {
         val draft = _songEditorDraft.value?.takeIf { it.id == songId } ?: return
+        saveSongEdits(
+            songId = songId,
+            title = title,
+            artist = artist,
+            album = album,
+            replacementArtwork = replacementArtwork,
+            playbackStartMs = draft.playbackStartMs,
+            playbackEndMs = draft.playbackEndMs,
+        )
+    }
+
+    fun saveSongEdits(
+        songId: Long,
+        title: String,
+        artist: String,
+        album: String,
+        replacementArtwork: Uri?,
+        playbackStartMs: Long,
+        playbackEndMs: Long?,
+    ) {
+        val draft = _songEditorDraft.value?.takeIf { it.id == songId } ?: return
         if (_songEditSaving.value) return
         val editor = songMetadataEditor ?: return
         val matches = _allSongs.value.filter { it.id == songId }
@@ -392,15 +415,29 @@ class MainViewModel internal constructor(
             _songEditError.value = "歌曲已变更或正在移动，请关闭编辑窗口并刷新曲库"
             return
         }
+        val playbackRange = runCatching {
+            SongPlaybackRangeConstraints.requireValid(
+                sourceDurationMs = draft.durationMs,
+                startMs = playbackStartMs,
+                endMs = playbackEndMs,
+            )
+        }.getOrElse { error ->
+            _songEditError.value = error.message ?: "歌曲裁剪范围无效"
+            return
+        }
+        val editedDraft = draft.copy(
+            playbackStartMs = playbackRange.startMs,
+            playbackEndMs = playbackRange.persistedEndMs(draft.durationMs),
+        )
         _songEditSaving.value = true
         _songEditError.value = null
         viewModelScope.launch {
             try {
-                val updated = editor.save(draft, title, artist, album, replacementArtwork)
+                val updated = editor.save(editedDraft, title, artist, album, replacementArtwork)
                 songMetadataRevision++
                 _allSongs.value = _allSongs.value.map { if (it.id == songId) updated else it }
                 _songEditorDraft.value = null
-                _messages.emit("歌曲信息已保存")
+                _messages.emit("歌曲编辑已保存")
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Exception) {

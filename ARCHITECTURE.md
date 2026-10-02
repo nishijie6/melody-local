@@ -14,7 +14,7 @@ SAF lyric tree ─────────── LyricsResolver ─────�
         │                ▲       ▲                      │
         │                │       └── LRCLIB (opt-in)    │
         │          embedded tags                        ▼
-Private lyrics/artwork ◄──── Room v3 ─────────── MainViewModel
+Private lyrics/artwork ◄──── Room v4 ─────────── MainViewModel
                                                    │       │
                                                    ▼       ▼
                                               Compose UI  PlayerConnection
@@ -40,7 +40,7 @@ The UI does not own the ExoPlayer instance. It sends commands through `PlayerCon
 
 ### Local music library
 
-`MusicRepository` queries `MediaStore.Audio.Media.EXTERNAL_CONTENT_URI`. It keeps rows marked as music with a positive duration and maps their metadata to `Song` values. `SongMetadataStore` overlays user-edited title, artist, album and private artwork before the values reach playback notifications or Compose. The application stores MediaStore IDs and content URIs, not private copies of audio files.
+`MusicRepository` queries `MediaStore.Audio.Media.EXTERNAL_CONTENT_URI`. It keeps rows marked as music with a positive duration and maps their metadata to `Song` values. `SongMetadataStore` overlays user-edited title, artist, album, private artwork and non-destructive playback boundaries before the values reach playback notifications or Compose. The application stores MediaStore IDs and content URIs, not private copies of audio files.
 
 ### Video audio import
 
@@ -92,11 +92,13 @@ Every queue item also carries a small typed source snapshot and queue generation
 
 `MainViewModel` owns the editing target and save/error state, blocks duplicate saves and overlapping playlist relocation, and rejects ambiguous or changed song identities. Playlist relocation sets an identity-refresh gate synchronously when an operation starts. Completed, cancelled and recoverably failed work all force a fresh MediaStore load; only a successful post-operation load unlocks editing, while a failed load leaves the gate closed for a later retry. A refresh generation discards older library loads. Failed identity refreshes retain the last visible library and expose a persistent retry action. Ordinary refreshes can still overlap a save because the metadata revision makes them retry instead of publishing stale values. `MusicService` observes committed overrides through Room even when the UI controller is closed. It updates only matching items' metadata, preserving the canonical queue, playback position and mode, and refreshing system lyric subtitles. Reapplying unchanged values is a no-op, avoiding a timeline-event loop.
 
+The same editor stores an optional playback start/end range on the override. `PlayerConnection` converts it into Media3 `ClippingConfiguration` when building the canonical queue; ExoPlayer therefore owns exact start, end and automatic transition behavior in foreground, background, notification and every traversal mode. `MusicService` reinstalls the same logical queue whenever any playback range changes, because even an unplayed item already owns a Media3 source and an unclipped source cannot gain a clipping wrapper through a metadata update. A current range change restarts at relative position zero; a non-current range change preserves the current position. Both preserve play/pause state, repeat/shuffle policy, queue source and mode. Player UI time is clip-relative. Queue metadata also retains the original duration and start offset, so in-app lyrics, lyric seeking/editing and service-side notification lyrics stay on the original source timeline.
+
 ### Playlist storage
 
 Room stores playlists in `playlists` and membership in `playlist_songs`. The join table uses `(playlistId, songId)` as its primary key, so a song cannot appear twice in one playlist. A foreign key removes memberships when their playlist is deleted.
 
-Playlist names are trimmed, limited to 40 characters and protected by a NOCASE unique Room index. Database migration 1→2 preserves duplicate legacy playlists by assigning deterministic suffixes before adding the index. Migration 2→3 adds `song_overrides`, `move_operations` and `move_items` without rewriting existing playlists or membership. Membership uses a `(playlistId, addedAt)` index for ordered reads; ID remapping removes old memberships and inserts their replacements inside one Room transaction, so either the complete mapping commits or the original memberships remain.
+Playlist names are trimmed, limited to 40 characters and protected by a NOCASE unique Room index. Database migration 1→2 preserves duplicate legacy playlists by assigning deterministic suffixes before adding the index. Migration 2→3 adds `song_overrides`, `move_operations` and `move_items` without rewriting existing playlists or membership. Migration 3→4 adds nullable playback-end and zero-default playback-start columns, so every existing override initially retains full-song playback. Membership uses a `(playlistId, addedAt)` index for ordered reads; ID remapping removes old memberships and inserts their replacements inside one Room transaction, so either the complete mapping commits or the original memberships remain.
 
 ### Lyrics
 
@@ -145,7 +147,7 @@ Android cloud backup and device transfer are disabled for application-private da
 
 ## Tests
 
-JVM tests cover LRC/enhanced-LRC parsing, multilingual grouping, embedded tag extraction, local and LRCLIB matching, request throttling, timeline editing, output-route timing, bounded/atomic writes, queue traversal, playlist validation and media-operation recovery rules. Android instrumentation tests cover lyric persistence and system-lyrics settings in addition to MediaStore mapping, Media3 control, Room 1→2→3 migrations, multi-playlist ID remapping, metadata/journal persistence, ViewModel state and real Transformer output. CI runs device tests on API 26, 29 and 36; actual notification/lock-screen layouts, overlay policies, OEM document providers and Bluetooth codec latency still require representative-device testing.
+JVM tests cover LRC/enhanced-LRC parsing, multilingual grouping, embedded tag extraction, local and LRCLIB matching, request throttling, timeline editing, song playback ranges, output-route timing, bounded/atomic writes, queue traversal, playlist validation and media-operation recovery rules. Android instrumentation tests cover lyric persistence and system-lyrics settings in addition to MediaStore mapping, Media3 control and clipping, Room 1→2→3→4 migrations, multi-playlist ID remapping, metadata/journal persistence, ViewModel state and real Transformer output. CI runs device tests on API 26, 29 and 36; actual notification/lock-screen layouts, overlay policies, OEM document providers and Bluetooth codec latency still require representative-device testing.
 
 ## Trade-offs
 

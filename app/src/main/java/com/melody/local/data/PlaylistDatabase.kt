@@ -54,6 +54,8 @@ data class SongOverrideEntity(
     val artist: String,
     val album: String,
     val artworkPath: String?,
+    @ColumnInfo(defaultValue = "0") val playbackStartMs: Long = 0L,
+    val playbackEndMs: Long? = null,
     val createdAt: Long = System.currentTimeMillis(),
 )
 
@@ -260,7 +262,7 @@ abstract class SongStateDao {
         MoveOperationEntity::class,
         MoveItemEntity::class,
     ],
-    version = 3,
+    version = 4,
     exportSchema = false,
 )
 abstract class PlaylistDatabase : RoomDatabase() {
@@ -277,7 +279,7 @@ abstract class PlaylistDatabase : RoomDatabase() {
                 PlaylistDatabase::class.java,
                 "melody_playlists.db",
             )
-                .addMigrations(MIGRATION_1_2, MIGRATION_2_3)
+                .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
                 .build()
                 .also { instance = it }
         }
@@ -371,6 +373,19 @@ abstract class PlaylistDatabase : RoomDatabase() {
                 db.execSQL(
                     "CREATE INDEX IF NOT EXISTS index_move_items_oldSongId " +
                         "ON move_items(oldSongId)"
+                )
+            }
+        }
+
+        internal val MIGRATION_3_4 = object : Migration(3, 4) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "ALTER TABLE song_overrides " +
+                        "ADD COLUMN playbackStartMs INTEGER NOT NULL DEFAULT 0"
+                )
+                db.execSQL(
+                    "ALTER TABLE song_overrides " +
+                        "ADD COLUMN playbackEndMs INTEGER"
                 )
             }
         }

@@ -76,6 +76,12 @@ class MusicRepository internal constructor(
                 val id = cursor.getLong(idColumn)
                 val albumId = cursor.getLong(albumIdColumn)
                 val override = overrides[id]
+                val durationMs = cursor.getLong(durationColumn)
+                val playbackRange = SongPlaybackRangeConstraints.normalize(
+                    sourceDurationMs = durationMs,
+                    startMs = override?.playbackStartMs ?: 0L,
+                    endMs = override?.playbackEndMs,
+                )
                 val title = override?.title
                     ?: cursor.getString(titleColumn).cleanMetadata("未知歌曲")
                 val artist = override?.artist
@@ -97,7 +103,7 @@ class MusicRepository internal constructor(
                     artist = artist,
                     album = album,
                     albumId = albumId,
-                    durationMs = cursor.getLong(durationColumn),
+                    durationMs = durationMs,
                     trackNumber = cursor.getInt(trackColumn) % 1_000,
                     dateAddedSeconds = cursor.getLong(dateAddedColumn),
                     // VOLUME_EXTERNAL is a read-only merged view. Keep the concrete volume in the
@@ -107,6 +113,8 @@ class MusicRepository internal constructor(
                         ?: albumId.takeIf { it > 0 }?.let {
                             ContentUris.withAppendedId(ALBUM_ART_URI, it)
                         },
+                    playbackStartMs = playbackRange.startMs,
+                    playbackEndMs = playbackRange.persistedEndMs(durationMs),
                 )
             }
         }

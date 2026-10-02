@@ -55,6 +55,22 @@ class SongMetadataEditorInstrumentedTest {
         assertEquals("New artist", reloaded.artist)
         assertEquals("New album", reloaded.album)
         assertEquals(original.albumArtUri.toString(), reloaded.artworkPath)
+        assertEquals(0L, reloaded.playbackStartMs)
+        assertNull(reloaded.playbackEndMs)
+    }
+
+    @Test fun savesNonDestructivePlaybackRangeWithMetadata() = runBlocking {
+        val editedRange = song().copy(playbackStartMs = 2_000L, playbackEndMs = 8_000L)
+
+        val result = editor().save(editedRange, "Trimmed", "Artist", "Album", null)
+
+        assertEquals(2_000L, result.playbackStartMs)
+        assertEquals(8_000L, result.playbackEndMs)
+        assertEquals(editedRange.contentUri, result.contentUri)
+        assertEquals(editedRange.durationMs, result.durationMs)
+        val reloaded = metadata.getAll().getValue(editedRange.id)
+        assertEquals(2_000L, reloaded.playbackStartMs)
+        assertEquals(8_000L, reloaded.playbackEndMs)
     }
 
     @Test fun selectedArtworkIsCopiedDownsampledAndSurvivesSourceRemoval() = runBlocking {
@@ -119,6 +135,18 @@ class SongMetadataEditorInstrumentedTest {
             assertTrue(runCatching { editor.save(song(), title, "A", "B", artwork) }.isFailure)
             assertEquals(before, metadata.getAll())
         }
+        assertTrue(
+            runCatching {
+                editor.save(
+                    song().copy(playbackStartMs = 8_500L),
+                    "Changed",
+                    "A",
+                    "B",
+                    null,
+                )
+            }.isFailure
+        )
+        assertEquals(before, metadata.getAll())
     }
 
     @Test fun artworkLargerThanTwentyMiBIsRejectedBeforeDecodeOrPersistence() = runBlocking {

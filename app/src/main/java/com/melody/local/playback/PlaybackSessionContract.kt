@@ -12,6 +12,9 @@ internal val SET_AUDIO_MIXING_COMMAND = SessionCommand(ACTION_SET_AUDIO_MIXING, 
 internal const val EXTRA_QUEUE_GENERATION = "com.melody.local.playback.QUEUE_GENERATION"
 internal const val EXTRA_QUEUE_CONTENT_REVISION =
     "com.melody.local.playback.QUEUE_CONTENT_REVISION"
+internal const val EXTRA_SOURCE_DURATION_MS = "com.melody.local.playback.SOURCE_DURATION_MS"
+internal const val EXTRA_PLAYBACK_START_MS = "com.melody.local.playback.PLAYBACK_START_MS"
+internal const val EXTRA_PLAYBACK_END_MS = "com.melody.local.playback.PLAYBACK_END_MS"
 
 internal fun playbackModeBundle(mode: PlaybackMode): Bundle = Bundle().apply {
     putString(ARG_PLAYBACK_MODE, mode.name)

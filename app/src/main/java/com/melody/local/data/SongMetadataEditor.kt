@@ -57,7 +57,7 @@ internal object SongMetadataConstraints {
     }
 }
 
-/** App-local metadata; editing never rewrites or moves the source audio file. */
+/** App-local metadata and playback range; editing never rewrites or moves the source audio file. */
 class LocalSongMetadataEditor(
     context: Context,
     private val metadata: SongMetadataStore,
@@ -73,20 +73,29 @@ class LocalSongMetadataEditor(
         replacementArtwork: Uri?,
     ): Song {
         val normalized = SongMetadataConstraints.normalize(title, artist, album)
+        val playbackRange = SongPlaybackRangeConstraints.requireValid(
+            sourceDurationMs = song.durationMs,
+            startMs = song.playbackStartMs,
+            endMs = song.playbackEndMs,
+        )
+        val normalizedSong = song.copy(
+            playbackStartMs = playbackRange.startMs,
+            playbackEndMs = playbackRange.persistedEndMs(song.durationMs),
+        )
         // Once Save is accepted, finish the file/DB commit even if the Activity is closed.
         // On a DB failure only the newly created artwork is removed; old metadata stays usable.
         return withContext(NonCancellable + Dispatchers.IO) {
             var newArtwork: File? = null
             try {
-                val previouslyDisplayedArtwork = song.albumArtUri
+                val previouslyDisplayedArtwork = normalizedSong.albumArtUri
                     ?.toString()
                     ?.let(::appOwnedArtworkFileOrNull)
                 newArtwork = replacementArtwork?.let(::copyArtwork)
-                val updated = song.copy(
+                val updated = normalizedSong.copy(
                     title = normalized.title,
                     artist = normalized.artist,
                     album = normalized.album,
-                    albumArtUri = newArtwork?.toUri() ?: song.albumArtUri,
+                    albumArtUri = newArtwork?.toUri() ?: normalizedSong.albumArtUri,
                 )
                 metadata.put(
                     SongMetadataOverride(
@@ -95,6 +104,8 @@ class LocalSongMetadataEditor(
                         artist = updated.artist,
                         album = updated.album,
                         artworkPath = updated.albumArtUri?.toString(),
+                        playbackStartMs = updated.playbackStartMs,
+                        playbackEndMs = updated.playbackEndMs,
                     )
                 )
                 if (newArtwork != null) {

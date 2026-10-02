@@ -8,6 +8,9 @@ import androidx.media3.common.Player
 import com.melody.local.data.Song
 import com.melody.local.lyrics.AppLyricsRuntime
 import com.melody.local.lyrics.ParsedLyrics
+import com.melody.local.playback.EXTRA_PLAYBACK_END_MS
+import com.melody.local.playback.playbackStartMsOrZero
+import com.melody.local.playback.sourceDurationMsOrNull
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -163,8 +166,12 @@ class SystemLyricsCoordinator(
         val songId = loadedSongId
         val lyrics = loadedLyrics
         val appliedDelay = settings.appliedDelayMs(outputRoute)
+        val sourcePositionMs = player.currentMediaItem?.mediaMetadata?.extras
+            ?.playbackStartMsOrZero()
+            ?.plus(player.currentPosition.coerceAtLeast(0L))
+            ?: player.currentPosition.coerceAtLeast(0L)
         val position = LyricsTimingPolicy.lyricPositionMs(
-            playbackPositionMs = player.currentPosition.coerceAtLeast(0L),
+            playbackPositionMs = sourcePositionMs,
             appliedDelayMs = appliedDelay,
         )
         val (currentLine, nextLine) = SystemLyricsLineSelector.visibleLines(lyrics, position)
@@ -188,7 +195,10 @@ class SystemLyricsCoordinator(
         if (item.mediaId.toLongOrNull() != expectedSongId) return null
         val uri = item.localConfiguration?.uri ?: return null
         val metadata = item.mediaMetadata
-        val safeDuration = player.duration.takeUnless { it == C.TIME_UNSET || it < 0L } ?: 0L
+        val playbackStartMs = metadata.extras?.playbackStartMsOrZero() ?: 0L
+        val safeDuration = metadata.extras?.sourceDurationMsOrNull()
+            ?: player.duration.takeUnless { it == C.TIME_UNSET || it < 0L }?.plus(playbackStartMs)
+            ?: 0L
         return Song(
             id = expectedSongId,
             title = metadata.title?.toString()?.takeIf(String::isNotBlank) ?: item.mediaId,
@@ -200,6 +210,10 @@ class SystemLyricsCoordinator(
             dateAddedSeconds = 0L,
             contentUri = uri,
             albumArtUri = metadata.artworkUri,
+            playbackStartMs = playbackStartMs,
+            playbackEndMs = metadata.extras
+                ?.takeIf { it.containsKey(EXTRA_PLAYBACK_END_MS) }
+                ?.getLong(EXTRA_PLAYBACK_END_MS),
         )
     }
 

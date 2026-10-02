@@ -140,6 +140,175 @@ class PlayerConnectionInstrumentedTest {
     }
 
     @Test
+    fun clippedSongUsesRelativeProgressAndAutomaticallyAdvancesAtTheSavedEnd() {
+        val trimmed = song(31L, "Trimmed", "Artist", "Album", null).copy(
+            playbackStartMs = 5_000L,
+            playbackEndMs = 7_000L,
+        )
+        val next = song(32L, "Next", "Artist", "Album", null)
+
+        onMain {
+            connection.setPlaybackMode(PlaybackMode.SEQUENTIAL)
+            connection.playQueue(listOf(trimmed, next), 0)
+        }
+        waitUntil {
+            val state = connection.state.value
+            state.mediaId == trimmed.id && state.durationMs in 1_900L..2_100L
+        }
+
+        assertEquals(5_000L, connection.state.value.playbackStartMs)
+        assertTrue(connection.state.value.sourcePositionMs >= 5_000L)
+        assertTrue(connection.state.value.positionMs < connection.state.value.sourcePositionMs)
+        waitUntil(timeoutMs = 5_000L) { connection.state.value.mediaId == next.id }
+    }
+
+    @Test
+    fun trimmingQueuedSongPreservesPausedCurrentPositionAndAppliesRealPlaybackBounds() = runBlocking {
+        val dao = PlaylistDatabase.getInstance(context).songStateDao()
+        val currentId = 705L
+        val trimmedId = 706L
+        val followingId = 707L
+        val ids = listOf(currentId, trimmedId, followingId)
+        val previousOverrides = ids.associateWith { dao.getOverride(it) }
+        try {
+            ids.forEach { dao.deleteOverride(it) }
+            val songs = listOf(
+                song(currentId, "Paused current", "Artist", "Album", null),
+                song(trimmedId, "Originally complete", "Artist", "Album", null),
+                song(followingId, "After trimmed song", "Artist", "Album", null),
+            )
+            onMain {
+                connection.setPlaybackMode(PlaybackMode.SEQUENTIAL)
+                connection.playQueue(songs, 0)
+            }
+            waitUntil {
+                connection.state.value.mediaId == currentId && connection.state.value.isPlaying
+            }
+            onMain { connection.togglePlayPause() }
+            waitUntil { !connection.state.value.isPlaying }
+            onMain { connection.seekTo(3_000L) }
+            waitUntil { connection.state.value.positionMs in 2_900L..3_100L }
+            val pausedPositionMs = connection.state.value.positionMs
+
+            dao.upsertOverride(
+                SongOverrideEntity(
+                    songId = trimmedId,
+                    title = "Queued trim committed 2-6 seconds",
+                    artist = "Artist",
+                    album = "Album",
+                    artworkPath = null,
+                    playbackStartMs = 2_000L,
+                    playbackEndMs = 6_000L,
+                )
+            )
+            // Wait for the service's committed queue update before selecting B. Otherwise the
+            // test can accidentally exercise the already-covered current-item clipping path.
+            waitUntil {
+                connection.state.value.queueItems.any {
+                    it.mediaId == trimmedId && it.title == "Queued trim committed 2-6 seconds"
+                }
+            }
+            assertEquals(currentId, connection.state.value.mediaId)
+            assertTrue(!connection.state.value.isPlaying)
+            assertTrue(
+                kotlin.math.abs(connection.state.value.positionMs - pausedPositionMs) <= 100L
+            )
+
+            onMain { connection.seekToQueueItem(1) }
+            waitUntil {
+                val state = connection.state.value
+                state.mediaId == trimmedId && state.durationMs > 0L
+            }
+            assertEquals(2_000L, connection.state.value.playbackStartMs)
+            assertTrue(
+                "Queued clipping must change the actual Media3 duration",
+                connection.state.value.durationMs in 3_900L..4_100L,
+            )
+            assertTrue(!connection.state.value.isPlaying)
+            onMain { connection.togglePlayPause() }
+            waitUntil { connection.state.value.isPlaying }
+            waitUntil(timeoutMs = 6_000L) { connection.state.value.mediaId == followingId }
+        } finally {
+            ids.forEach { id ->
+                val previous = previousOverrides[id]
+                if (previous == null) dao.deleteOverride(id) else dao.upsertOverride(previous)
+            }
+        }
+    }
+
+    @Test
+    fun editingCurrentSongRangeRestartsAtTrimStartWithoutReplacingTheQueue() = runBlocking {
+        val dao = PlaylistDatabase.getInstance(context).songStateDao()
+        val currentId = 703L
+        val nextId = 704L
+        val previousCurrent = dao.getOverride(currentId)
+        val previousNext = dao.getOverride(nextId)
+        try {
+            dao.deleteOverride(currentId)
+            dao.deleteOverride(nextId)
+            val songs = listOf(
+                song(currentId, "Original", "Artist", "Album", null),
+                song(nextId, "Next", "Artist", "Album", null),
+            )
+            onMain {
+                connection.setPlaybackMode(PlaybackMode.REVERSE)
+                connection.playQueue(songs, 0)
+            }
+            waitUntil { connection.state.value.mediaId == currentId && connection.state.value.isPlaying }
+            onMain { connection.seekTo(3_000L) }
+            waitUntil { connection.state.value.positionMs >= 2_500L }
+
+            dao.upsertOverride(
+                SongOverrideEntity(
+                    songId = currentId,
+                    title = "Original",
+                    artist = "Artist",
+                    album = "Album",
+                    artworkPath = null,
+                    playbackStartMs = 4_000L,
+                    playbackEndMs = 9_000L,
+                )
+            )
+            waitUntil {
+                val state = connection.state.value
+                state.playbackStartMs == 4_000L &&
+                    state.durationMs in 4_900L..5_100L &&
+                    state.positionMs < 1_500L &&
+                    state.isPlaying
+            }
+
+            assertEquals(currentId, connection.state.value.mediaId)
+            assertEquals(listOf(currentId, nextId), connection.state.value.queueItems.map { it.mediaId })
+            assertEquals(PlaybackMode.REVERSE, connection.state.value.playbackMode)
+            assertTrue(connection.state.value.isPlaying)
+
+            dao.upsertOverride(
+                SongOverrideEntity(
+                    songId = nextId,
+                    title = "Next",
+                    artist = "Artist",
+                    album = "Album",
+                    artworkPath = null,
+                    playbackStartMs = 2_000L,
+                    playbackEndMs = 6_000L,
+                )
+            )
+            onMain { connection.seekToNext() }
+            waitUntil {
+                val state = connection.state.value
+                state.mediaId == nextId &&
+                    state.playbackStartMs == 2_000L &&
+                    state.durationMs in 3_900L..4_100L
+            }
+        } finally {
+            if (previousCurrent == null) dao.deleteOverride(currentId)
+            else dao.upsertOverride(previousCurrent)
+            if (previousNext == null) dao.deleteOverride(nextId)
+            else dao.upsertOverride(previousNext)
+        }
+    }
+
+    @Test
     fun systemLyricMetadataIsPublishedAndRestoresPreviousQueueItems() = runBlocking {
         val repository = LyricsRepository(context)
         val firstId = 81L

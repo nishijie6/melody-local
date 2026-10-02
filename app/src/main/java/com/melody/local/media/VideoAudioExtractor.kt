@@ -776,6 +776,8 @@ open class VideoAudioImportWorker(
                 metadataTitle = title,
                 metadataArtist = artist,
                 metadataAlbum = album,
+                metadataPlaybackStartMs = 0L,
+                metadataPlaybackEndMs = null,
                 artifactOwnerWorkerId = id,
                 metadataWriteIntent = false,
                 previousMetadataExisted = false,
@@ -783,6 +785,8 @@ open class VideoAudioImportWorker(
                 previousMetadataArtist = null,
                 previousMetadataAlbum = null,
                 previousMetadataArtworkPath = null,
+                previousMetadataPlaybackStartMs = null,
+                previousMetadataPlaybackEndMs = null,
             )
             // Record the allocated output before writing artwork or Room metadata. If either of
             // those stores is interrupted, recovery can still remove the exact pending output and
@@ -808,6 +812,8 @@ open class VideoAudioImportWorker(
                 previousMetadataArtist = previousMetadata?.artist,
                 previousMetadataAlbum = previousMetadata?.album,
                 previousMetadataArtworkPath = previousMetadata?.artworkPath,
+                previousMetadataPlaybackStartMs = previousMetadata?.playbackStartMs,
+                previousMetadataPlaybackEndMs = previousMetadata?.playbackEndMs,
             )
             // Persist both the expected value and the complete old value before the DAO write.
             // Recovery can then compare-and-delete a newly created override or restore an old one
@@ -2219,13 +2225,17 @@ open class VideoAudioImportWorker(
             record.metadataTitle != null && current.title == record.metadataTitle &&
             record.metadataArtist != null && current.artist == record.metadataArtist &&
             record.metadataAlbum != null && current.album == record.metadataAlbum &&
-            current.artworkPath == record.artworkUri?.toString()
+            current.artworkPath == record.artworkUri?.toString() &&
+            current.playbackStartMs == (record.metadataPlaybackStartMs ?: 0L) &&
+            current.playbackEndMs == record.metadataPlaybackEndMs
         val matchesPrevious = if (record.previousMetadataExisted) {
             current != null &&
                 current.title == record.previousMetadataTitle &&
                 current.artist == record.previousMetadataArtist &&
                 current.album == record.previousMetadataAlbum &&
-                current.artworkPath == record.previousMetadataArtworkPath
+                current.artworkPath == record.previousMetadataArtworkPath &&
+                current.playbackStartMs == (record.previousMetadataPlaybackStartMs ?: 0L) &&
+                current.playbackEndMs == record.previousMetadataPlaybackEndMs
         } else {
             current == null
         }
@@ -2241,6 +2251,8 @@ open class VideoAudioImportWorker(
                         artist = requireNotNull(record.previousMetadataArtist),
                         album = requireNotNull(record.previousMetadataAlbum),
                         artworkPath = record.previousMetadataArtworkPath,
+                        playbackStartMs = record.previousMetadataPlaybackStartMs ?: 0L,
+                        playbackEndMs = record.previousMetadataPlaybackEndMs,
                     )
                 )
             } else {
@@ -2264,7 +2276,9 @@ open class VideoAudioImportWorker(
                     restored.title == record.previousMetadataTitle &&
                     restored.artist == record.previousMetadataArtist &&
                     restored.album == record.previousMetadataAlbum &&
-                    restored.artworkPath == record.previousMetadataArtworkPath
+                    restored.artworkPath == record.previousMetadataArtworkPath &&
+                    restored.playbackStartMs == (record.previousMetadataPlaybackStartMs ?: 0L) &&
+                    restored.playbackEndMs == record.previousMetadataPlaybackEndMs
             )
         } else {
             check(metadataStore.getAll()[record.songId] == null)
@@ -2430,6 +2444,8 @@ open class VideoAudioImportWorker(
         val metadataTitle: String?,
         val metadataArtist: String?,
         val metadataAlbum: String?,
+        val metadataPlaybackStartMs: Long?,
+        val metadataPlaybackEndMs: Long?,
         val artifactOwnerWorkerId: UUID,
         val metadataWriteIntent: Boolean,
         val previousMetadataExisted: Boolean,
@@ -2437,6 +2453,8 @@ open class VideoAudioImportWorker(
         val previousMetadataArtist: String?,
         val previousMetadataAlbum: String?,
         val previousMetadataArtworkPath: String?,
+        val previousMetadataPlaybackStartMs: Long?,
+        val previousMetadataPlaybackEndMs: Long?,
     ) {
         fun encode(): String = JSONObject()
             .put("workerId", workerId.toString())
@@ -2454,6 +2472,8 @@ open class VideoAudioImportWorker(
                 metadataTitle?.let { put("metadataTitle", it) }
                 metadataArtist?.let { put("metadataArtist", it) }
                 metadataAlbum?.let { put("metadataAlbum", it) }
+                metadataPlaybackStartMs?.let { put("metadataPlaybackStartMs", it) }
+                metadataPlaybackEndMs?.let { put("metadataPlaybackEndMs", it) }
                 put("artifactOwnerWorkerId", artifactOwnerWorkerId.toString())
                 put("metadataWriteIntent", metadataWriteIntent)
                 put("previousMetadataExisted", previousMetadataExisted)
@@ -2461,6 +2481,10 @@ open class VideoAudioImportWorker(
                 previousMetadataArtist?.let { put("previousMetadataArtist", it) }
                 previousMetadataAlbum?.let { put("previousMetadataAlbum", it) }
                 previousMetadataArtworkPath?.let { put("previousMetadataArtworkPath", it) }
+                previousMetadataPlaybackStartMs?.let {
+                    put("previousMetadataPlaybackStartMs", it)
+                }
+                previousMetadataPlaybackEndMs?.let { put("previousMetadataPlaybackEndMs", it) }
             }
             .toString()
 
@@ -2504,6 +2528,12 @@ open class VideoAudioImportWorker(
                         .takeIf(String::isNotBlank),
                     metadataAlbum = json.optString("metadataAlbum")
                         .takeIf(String::isNotBlank),
+                    metadataPlaybackStartMs = json.optLong("metadataPlaybackStartMs", 0L)
+                        .takeIf {
+                            json.has("metadataPlaybackStartMs") || json.has("metadataTitle")
+                        },
+                    metadataPlaybackEndMs = json.optLong("metadataPlaybackEndMs")
+                        .takeIf { json.has("metadataPlaybackEndMs") },
                     artifactOwnerWorkerId = json.optString("artifactOwnerWorkerId")
                         .takeIf(String::isNotBlank)
                         ?.let(UUID::fromString)
@@ -2521,6 +2551,16 @@ open class VideoAudioImportWorker(
                         .takeIf { json.has("previousMetadataAlbum") },
                     previousMetadataArtworkPath = json.optString("previousMetadataArtworkPath")
                         .takeIf { json.has("previousMetadataArtworkPath") },
+                    previousMetadataPlaybackStartMs = json.optLong(
+                        "previousMetadataPlaybackStartMs",
+                        0L,
+                    ).takeIf {
+                        json.has("previousMetadataPlaybackStartMs") ||
+                            json.optBoolean("previousMetadataExisted", false)
+                    },
+                    previousMetadataPlaybackEndMs = json.optLong(
+                        "previousMetadataPlaybackEndMs"
+                    ).takeIf { json.has("previousMetadataPlaybackEndMs") },
                 )
             }.getOrNull()
         }
