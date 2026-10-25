@@ -48,7 +48,12 @@ class PlayerConnectionInstrumentedTest {
     fun setUp() {
         audioFile = File(context.cacheDir, "player-connection-test.wav")
         writeSilentWave(audioFile, durationSeconds = 20)
-        onMain { connection = PlayerConnection(context) }
+        onMain {
+            connection = PlayerConnection(context)
+            connection.setPlaybackMode(PlaybackMode.SEQUENTIAL)
+        }
+        waitForServiceMode(PlaybackMode.SEQUENTIAL)
+        waitUntil { connection.state.value.playbackMode == PlaybackMode.SEQUENTIAL }
     }
 
     @After
@@ -110,6 +115,53 @@ class PlayerConnectionInstrumentedTest {
 
         onMain { connection.seekToNext() }
         waitUntil { connection.state.value.mediaId == 2L }
+    }
+
+    @Test
+    fun coldQueueHonorsAnExplicitSequentialChoiceOverTheStoredReverseMode() {
+        val songs = testSongs() + song(3L, "Third", "Artist 3", "Album 3", null)
+        onMain { connection.setPlaybackMode(PlaybackMode.REVERSE) }
+        waitUntil { connection.state.value.playbackMode == PlaybackMode.REVERSE }
+        waitForServiceMode(PlaybackMode.REVERSE)
+
+        onMain {
+            connection.release()
+            connection = PlayerConnection(context)
+            connection.setPlaybackMode(PlaybackMode.SEQUENTIAL)
+            connection.playQueue(songs, startIndex = 0)
+        }
+        waitUntil {
+            val state = connection.state.value
+            state.mediaId == 1L && state.isPlaying && state.playbackMode == PlaybackMode.SEQUENTIAL
+        }
+        waitForServiceMode(PlaybackMode.SEQUENTIAL)
+        assertEquals(listOf(1L, 2L, 3L), connection.state.value.queueItems.map { it.mediaId })
+
+        onMain { connection.seekToNext() }
+        waitUntil { connection.state.value.mediaId == 2L }
+    }
+
+    @Test
+    fun coldQueueHonorsAnExplicitDisabledMixingChoiceOverTheStoredEnabledSetting() {
+        try {
+            setAudioMixing(true)
+            waitUntil { connection.state.value.audioMixingEnabled }
+
+            onMain {
+                connection.release()
+                connection = PlayerConnection(context)
+                connection.setAudioMixingEnabled(false)
+                connection.playQueue(testSongs(), startIndex = 0)
+            }
+            waitUntil {
+                val state = connection.state.value
+                state.mediaId == 1L && state.isPlaying && !state.audioMixingEnabled
+            }
+            waitForServiceAudioMixing(false)
+            assertEquals(listOf(1L, 2L), connection.state.value.queueItems.map { it.mediaId })
+        } finally {
+            setAudioMixing(false)
+        }
     }
 
     @Test
@@ -182,7 +234,8 @@ class PlayerConnectionInstrumentedTest {
                 connection.playQueue(songs, 0)
             }
             waitUntil {
-                connection.state.value.mediaId == currentId && connection.state.value.isPlaying
+                val state = connection.state.value
+                state.mediaId == currentId && state.isPlaying && state.playbackMode == PlaybackMode.SEQUENTIAL
             }
             onMain { connection.togglePlayPause() }
             waitUntil { !connection.state.value.isPlaying }
@@ -209,6 +262,7 @@ class PlayerConnectionInstrumentedTest {
                 }
             }
             assertEquals(currentId, connection.state.value.mediaId)
+            assertEquals(PlaybackMode.SEQUENTIAL, connection.state.value.playbackMode)
             assertTrue(!connection.state.value.isPlaying)
             assertTrue(
                 kotlin.math.abs(connection.state.value.positionMs - pausedPositionMs) <= 100L

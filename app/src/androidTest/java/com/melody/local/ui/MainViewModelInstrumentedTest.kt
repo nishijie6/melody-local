@@ -2,6 +2,7 @@ package com.melody.local.ui
 
 import android.app.Application
 import android.app.PendingIntent
+import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import androidx.lifecycle.ViewModel
@@ -10,6 +11,7 @@ import androidx.lifecycle.ViewModelStore
 import androidx.lifecycle.ViewModelStoreOwner
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import androidx.test.platform.app.InstrumentationRegistry
 import com.melody.local.data.DuplicatePlaylistNameException
 import com.melody.local.data.MusicLibrary
 import com.melody.local.data.PlaylistStore
@@ -38,17 +40,24 @@ import com.melody.local.playback.PlaybackMode
 import com.melody.local.playback.PlaybackQueueSource
 import com.melody.local.playback.PlaybackUiState
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.emitAll
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withContext
 import java.io.IOException
+import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CopyOnWriteArrayList
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -86,17 +95,312 @@ class MainViewModelInstrumentedTest {
     @Test
     fun selectedPlaylistPreservesStoredOrderDropsMissingSongsAndClears() = runBlocking {
         val fixture = Fixture(music = FakeMusicLibrary { listOf(song(1), song(2), song(3)) })
-        val collection = launch { fixture.viewModel.selectedPlaylistSongs.collect() }
+        val collection = launch { fixture.viewModel.selectedPlaylistContents.collect() }
         fixture.viewModel.refreshSongs()
         waitUntil { fixture.viewModel.allSongs.value.size == 3 }
 
         fixture.playlists.songIds.value = listOf(3L, 999L, 1L)
         fixture.viewModel.selectPlaylist(42L)
-        waitUntil { fixture.viewModel.selectedPlaylistSongs.value.map { it.id } == listOf(3L, 1L) }
+        waitUntil { fixture.viewModel.selectedPlaylistContents.value.songs.map { it.id } == listOf(3L, 1L) }
 
         fixture.viewModel.selectPlaylist(null)
-        waitUntil { fixture.viewModel.selectedPlaylistSongs.value.isEmpty() }
+        waitUntil { fixture.viewModel.selectedPlaylistContents.value.songs.isEmpty() }
         collection.cancel()
+        fixture.clear()
+    }
+
+    @Test
+    fun playlistSortingUsesArtistThenTitleAndCanRestoreTheStoredOrder() = runBlocking {
+        val first = song(1).copy(title = "Beta", artist = "Zulu")
+        val second = song(2).copy(title = "Omega", artist = "Alpha")
+        val third = song(3).copy(title = "alpha", artist = "alpha")
+        val fixture = Fixture(music = FakeMusicLibrary { listOf(third, first, second) })
+        val collection = launch { fixture.viewModel.selectedPlaylistContents.collect() }
+        fixture.playlists.songIds.value = listOf(1L, 2L, 999L, 3L)
+        fixture.viewModel.refreshSongs()
+        fixture.viewModel.selectPlaylist(42L)
+        waitUntil { fixture.viewModel.selectedPlaylistContents.value.songs.map(Song::id) == listOf(1L, 2L, 3L) }
+
+        fixture.viewModel.updatePlaylistSort(PlaylistSort.ARTIST)
+        waitUntil { fixture.viewModel.selectedPlaylistContents.value.songs.map(Song::id) == listOf(3L, 2L, 1L) }
+        fixture.viewModel.updateSort(SongSort.RECENT)
+        assertEquals(PlaylistSort.ARTIST, fixture.viewModel.playlistSort.value)
+        fixture.viewModel.updatePlaylistSort(PlaylistSort.TITLE)
+        waitUntil { fixture.viewModel.selectedPlaylistContents.value.songs.map(Song::id) == listOf(3L, 1L, 2L) }
+        fixture.viewModel.updatePlaylistSort(PlaylistSort.ADDED)
+        waitUntil { fixture.viewModel.selectedPlaylistContents.value.songs.map(Song::id) == listOf(1L, 2L, 3L) }
+        assertEquals(listOf(1L, 2L, 999L, 3L), fixture.playlists.songIds.value)
+        assertEquals(SongSort.RECENT, fixture.viewModel.sort.value)
+        collection.cancel()
+        fixture.clear()
+    }
+
+    @Test
+    fun recreatingTheViewModelRestoresTheLastPlaylistAndSortAfterLeavingItsDetail() = runBlocking {
+        val preferencesName = "playlist_restore_${UUID.randomUUID()}"
+        val original = Fixture(preferencesName = preferencesName)
+        original.viewModel.selectPlaylist(1L)
+        original.viewModel.selectPlaylist(42L)
+        original.viewModel.updatePlaylistSort(PlaylistSort.ARTIST)
+        original.viewModel.selectPlaylist(null)
+        assertEquals(null, original.viewModel.selectedPlaylistId.value)
+        original.clear(clearPreferences = false)
+
+        val restored = Fixture(preferencesName = preferencesName)
+        assertEquals(42L, restored.viewModel.initialPlaylistId)
+        assertEquals(42L, restored.viewModel.selectedPlaylistId.value)
+        assertEquals(PlaylistSort.ARTIST, restored.viewModel.playlistSort.value)
+        waitUntil { restored.viewModel.playlists.value.isNotEmpty() }
+        assertEquals(42L, restored.viewModel.selectedPlaylistId.value)
+        restored.clear()
+    }
+
+    @Test
+    fun missingRememberedPlaylistIsClearedOnlyAfterTheRepositoryLoads() = runBlocking {
+        val preferencesName = "playlist_missing_${UUID.randomUUID()}"
+        val preferences = PlaylistPreferences(application, preferencesName)
+        preferences.lastOpenedPlaylistId = 99L
+        val loaded = CompletableDeferred<Unit>()
+        val fixture = Fixture(
+            preferencesName = preferencesName,
+            playlists = FakePlaylistStore(loadGate = loaded),
+        )
+        delay(50)
+        assertTrue(fixture.viewModel.playlists.value.isEmpty())
+        assertEquals(99L, fixture.viewModel.selectedPlaylistId.value)
+        assertEquals(99L, preferences.lastOpenedPlaylistId)
+
+        loaded.complete(Unit)
+        waitUntil { fixture.viewModel.playlists.value.isNotEmpty() }
+        assertEquals(null, fixture.viewModel.selectedPlaylistId.value)
+        assertEquals(null, preferences.lastOpenedPlaylistId)
+        fixture.clear()
+    }
+
+    @Test
+    fun emptyLoadedPlaylistDirectoryClearsTheRememberedSelectionAfterLoading() = runBlocking {
+        val preferencesName = "playlist_empty_directory_${UUID.randomUUID()}"
+        val preferences = PlaylistPreferences(application, preferencesName)
+        preferences.lastOpenedPlaylistId = 42L
+        val loaded = CompletableDeferred<Unit>()
+        val playlists = FakePlaylistStore(loadGate = loaded).apply {
+            summaries.value = emptyList()
+        }
+        val fixture = Fixture(preferencesName = preferencesName, playlists = playlists)
+        val collection = launch { fixture.viewModel.selectedPlaylistContents.collect() }
+        try {
+            delay(50L)
+            assertTrue(fixture.viewModel.playlists.value.isEmpty())
+            assertEquals(42L, fixture.viewModel.selectedPlaylistId.value)
+            assertEquals(42L, preferences.lastOpenedPlaylistId)
+
+            loaded.complete(Unit)
+            waitUntil {
+                fixture.viewModel.selectedPlaylistId.value == null &&
+                    preferences.lastOpenedPlaylistId == null
+            }
+            assertTrue(fixture.viewModel.playlists.value.isEmpty())
+            waitUntil { fixture.viewModel.selectedPlaylistContents.value.songs.isEmpty() }
+        } finally {
+            loaded.complete(Unit)
+            collection.cancelAndJoin()
+            fixture.clear()
+        }
+    }
+
+    @Test
+    fun returningToTheFirstPlaylistIgnoresTheDelayedSecondPlaylistResult() = runBlocking {
+        val secondStarted = CompletableDeferred<Unit>()
+        val secondCancellationObserved = CompletableDeferred<Unit>()
+        val releaseSecond = CompletableDeferred<Unit>()
+        val secondFinished = CompletableDeferred<Unit>()
+        val playlists = FakePlaylistStore().apply {
+            songIdsFor(42L).value = listOf(1L)
+            songIdsFor(1L).value = listOf(2L)
+            songIdFlows[1L] = flow {
+                secondStarted.complete(Unit)
+                try {
+                    val result = try {
+                        releaseSecond.await()
+                        songIdsFor(1L).value
+                    } catch (_: CancellationException) {
+                        // Model a repository read returning after its caller was cancelled.
+                        secondCancellationObserved.complete(Unit)
+                        withContext(NonCancellable) {
+                            releaseSecond.await()
+                            songIdsFor(1L).value
+                        }
+                    }
+                    emit(result)
+                } finally {
+                    secondFinished.complete(Unit)
+                }
+            }
+        }
+        val fixture = Fixture(
+            music = FakeMusicLibrary { listOf(song(1), song(2)) },
+            playlists = playlists,
+        )
+        val observed = mutableListOf<PlaylistContents>()
+        val collection = launch { fixture.viewModel.selectedPlaylistContents.collect(observed::add) }
+        try {
+            fixture.viewModel.refreshSongs()
+            fixture.viewModel.selectPlaylist(42L)
+            waitUntil {
+                val contents = fixture.viewModel.selectedPlaylistContents.value
+                contents.playlistId == 42L && !contents.isLoading &&
+                    contents.songs.map(Song::id) == listOf(1L)
+            }
+
+            fixture.viewModel.selectPlaylist(1L)
+            withTimeout(5_000L) { secondStarted.await() }
+            val afterReturningIndex = observed.size
+            fixture.viewModel.selectPlaylist(42L)
+            withTimeout(5_000L) { secondCancellationObserved.await() }
+            releaseSecond.complete(Unit)
+            withTimeout(5_000L) { secondFinished.await() }
+            waitUntil {
+                val contents = fixture.viewModel.selectedPlaylistContents.value
+                playlists.observedPlaylistIds.count { it == 42L } >= 2 &&
+                    contents.playlistId == 42L && !contents.isLoading &&
+                    contents.songs.map(Song::id) == listOf(1L)
+            }
+            delay(50L)
+            assertFalse(observed.drop(afterReturningIndex).any { contents ->
+                contents.playlistId == 1L && contents.songs.any { it.id == 2L }
+            })
+            assertEquals(listOf(1L), playlists.songIdsFor(42L).value)
+            assertEquals(listOf(2L), playlists.songIdsFor(1L).value)
+            assertEquals(42L, fixture.preferences.lastOpenedPlaylistId)
+        } finally {
+            releaseSecond.complete(Unit)
+            collection.cancelAndJoin()
+            fixture.clear()
+        }
+    }
+
+    @Test
+    fun playlistPlaybackRejectsOldSelectionSortAndSnapshotInstances() = runBlocking {
+        val first = song(1).copy(artist = "Zulu")
+        val second = song(2).copy(artist = "Alpha")
+        val third = song(3)
+        val secondStarted = CompletableDeferred<Unit>()
+        val releaseSecond = CompletableDeferred<Unit>()
+        val playlists = FakePlaylistStore().apply {
+            songIdsFor(42L).value = listOf(first.id, second.id)
+            songIdsFor(1L).value = listOf(third.id)
+            songIdFlows[1L] = flow {
+                secondStarted.complete(Unit)
+                releaseSecond.await()
+                emit(songIdsFor(1L).value)
+            }
+        }
+        val fixture = Fixture(
+            music = FakeMusicLibrary { listOf(first, second, third) },
+            playlists = playlists,
+        )
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        val collection = launch { fixture.viewModel.selectedPlaylistContents.collect() }
+        try {
+            fixture.viewModel.refreshSongs()
+            fixture.viewModel.selectPlaylist(42L)
+            waitUntil {
+                val contents = fixture.viewModel.selectedPlaylistContents.value
+                contents.playlistId == 42L && !contents.isLoading &&
+                    contents.songs.map(Song::id) == listOf(first.id, second.id)
+            }
+            val original = fixture.viewModel.selectedPlaylistContents.value
+
+            instrumentation.runOnMainSync {
+                fixture.viewModel.selectPlaylist(1L)
+                fixture.viewModel.playPlaylistSongs(original, 0, "Selected")
+            }
+            withTimeout(5_000L) { secondStarted.await() }
+            assertEquals(0, fixture.player.playCalls)
+
+            fixture.viewModel.selectPlaylist(42L)
+            waitUntil {
+                val contents = fixture.viewModel.selectedPlaylistContents.value
+                playlists.observedPlaylistIds.count { it == 42L } >= 2 &&
+                    contents !== original && contents.playlistId == 42L && !contents.isLoading &&
+                    contents.songs.map(Song::id) == listOf(first.id, second.id)
+            }
+            val reloaded = fixture.viewModel.selectedPlaylistContents.value
+            instrumentation.runOnMainSync {
+                // The old snapshot has the same ID, sort and songs, but belongs to a prior visit.
+                fixture.viewModel.playPlaylistSongs(original, 0, "Selected")
+                fixture.viewModel.updatePlaylistSort(PlaylistSort.ARTIST)
+                fixture.viewModel.playPlaylistSongs(reloaded, 0, "Selected")
+            }
+            assertEquals(0, fixture.player.playCalls)
+
+            waitUntil {
+                val contents = fixture.viewModel.selectedPlaylistContents.value
+                contents.playlistId == 42L && contents.sort == PlaylistSort.ARTIST &&
+                    !contents.isLoading && contents.songs.map(Song::id) == listOf(second.id, first.id)
+            }
+            val current = fixture.viewModel.selectedPlaylistContents.value
+            instrumentation.runOnMainSync {
+                fixture.viewModel.playPlaylistSongs(current, 1, "Selected")
+            }
+            assertEquals(1, fixture.player.playCalls)
+            assertEquals(listOf(second.id, first.id), fixture.player.lastPlayedSongs.map(Song::id))
+            assertEquals(1, fixture.player.lastStartIndex)
+            assertEquals(PlaybackQueueSource.playlist(42L, "Selected"), fixture.player.lastSource)
+        } finally {
+            releaseSecond.complete(Unit)
+            collection.cancelAndJoin()
+            fixture.clear()
+        }
+    }
+
+    @Test
+    fun emptyRememberedPlaylistAndRenamingKeepTheSameStartupIdentity() = runBlocking {
+        val preferencesName = "playlist_empty_${UUID.randomUUID()}"
+        val preferences = PlaylistPreferences(application, preferencesName)
+        preferences.lastOpenedPlaylistId = 42L
+        val fixture = Fixture(preferencesName = preferencesName)
+        val collection = launch { fixture.viewModel.selectedPlaylistContents.collect() }
+        waitUntil { fixture.viewModel.playlists.value.isNotEmpty() }
+        assertTrue(fixture.viewModel.selectedPlaylistContents.value.songs.isEmpty())
+        assertEquals(42L, fixture.viewModel.selectedPlaylistId.value)
+
+        fixture.playlists.summaries.value = fixture.playlists.summaries.value.map {
+            if (it.id == 42L) it.copy(name = "Renamed empty playlist") else it
+        }
+        waitUntil { fixture.viewModel.playlists.value.any { it.name == "Renamed empty playlist" } }
+        assertEquals(42L, fixture.viewModel.selectedPlaylistId.value)
+        assertEquals(42L, preferences.lastOpenedPlaylistId)
+        collection.cancel()
+        fixture.clear()
+    }
+
+    @Test
+    fun deletingTheRememberedPlaylistAfterLeavingItsDetailClearsTheSavedChoice() = runBlocking {
+        val fixture = Fixture()
+        fixture.viewModel.selectPlaylist(42L)
+        fixture.viewModel.selectPlaylist(null)
+        fixture.viewModel.deletePlaylist(1L)
+        waitUntil { fixture.playlists.deletedId == 1L }
+        assertEquals(42L, fixture.preferences.lastOpenedPlaylistId)
+
+        fixture.viewModel.deletePlaylist(42L)
+        waitUntil { fixture.preferences.lastOpenedPlaylistId == null }
+        assertEquals(null, fixture.viewModel.selectedPlaylistId.value)
+        fixture.clear()
+    }
+
+    @Test
+    fun unknownSavedSortAndNonpositivePlaylistIdUseSafeDefaults() {
+        val preferencesName = "playlist_invalid_${UUID.randomUUID()}"
+        application.getSharedPreferences(preferencesName, Context.MODE_PRIVATE).edit()
+            .putLong(PlaylistPreferences.KEY_LAST_OPENED_PLAYLIST, -1L)
+            .putString(PlaylistPreferences.KEY_SORT, "unknown_future_sort")
+            .commit()
+        val fixture = Fixture(preferencesName = preferencesName)
+        assertEquals(null, fixture.viewModel.initialPlaylistId)
+        assertEquals(null, fixture.viewModel.selectedPlaylistId.value)
+        assertEquals(PlaylistSort.ADDED, fixture.viewModel.playlistSort.value)
         fixture.clear()
     }
 
@@ -645,7 +949,7 @@ class MainViewModelInstrumentedTest {
                 original.copy(title = title, artist = artist, album = album)
             },
         )
-        val collection = launch { fixture.viewModel.selectedPlaylistSongs.collect() }
+        val collection = launch { fixture.viewModel.selectedPlaylistContents.collect() }
         fixture.playlists.songIds.value = listOf(2, 1)
         fixture.viewModel.selectPlaylist(42)
         fixture.viewModel.refreshSongs()
@@ -659,13 +963,66 @@ class MainViewModelInstrumentedTest {
         assertEquals(1L, fixture.viewModel.songEditorDraft.value?.id)
         gate.complete(Unit)
         waitUntil { fixture.viewModel.songEditorDraft.value == null }
-        waitUntil { fixture.viewModel.selectedPlaylistSongs.value.lastOrNull()?.title == "Edited" }
-        assertEquals(listOf(2L, 1L), fixture.viewModel.selectedPlaylistSongs.value.map { it.id })
+        waitUntil { fixture.viewModel.selectedPlaylistContents.value.songs.lastOrNull()?.title == "Edited" }
+        assertEquals(listOf(2L, 1L), fixture.viewModel.selectedPlaylistContents.value.songs.map { it.id })
         assertEquals(2L, fixture.player.state.value.mediaId)
         assertEquals(5000L, fixture.player.state.value.positionMs)
         assertEquals(0, fixture.player.stopCount)
         collection.cancel()
         fixture.clear()
+    }
+
+    @Test
+    fun editingAnArtistReordersThePlaylistWithoutChangingMembershipOrPlayback() = runBlocking {
+        val first = song(1).copy(artist = "Zulu")
+        val second = song(2).copy(artist = "Bravo")
+        val third = song(3).copy(artist = "Charlie")
+        val fixture = Fixture(
+            music = FakeMusicLibrary { listOf(third, first, second) },
+            songEditor = SongMetadataEditor { original, title, artist, album, _ ->
+                original.copy(title = title, artist = artist, album = album)
+            },
+        )
+        val collection = launch { fixture.viewModel.selectedPlaylistContents.collect() }
+        try {
+            fixture.playlists.songIds.value = listOf(3L, 1L, 2L)
+            fixture.viewModel.updatePlaylistSort(PlaylistSort.ARTIST)
+            fixture.viewModel.selectPlaylist(42L)
+            fixture.viewModel.refreshSongs()
+            waitUntil {
+                val contents = fixture.viewModel.selectedPlaylistContents.value
+                contents.sort == PlaylistSort.ARTIST && !contents.isLoading &&
+                    contents.songs.map(Song::id) == listOf(2L, 3L, 1L)
+            }
+            val playback = PlaybackUiState(
+                mediaId = second.id,
+                positionMs = 5_000L,
+                isPlaying = true,
+                playbackMode = PlaybackMode.LOOP,
+                queueSource = PlaybackQueueSource.playlist(42L, "Selected"),
+            )
+            fixture.player.mutableState.value = playback
+            fixture.viewModel.openSongEditor(first)
+            fixture.viewModel.saveSongMetadata(first.id, first.title, "Alpha", first.album, null)
+            waitUntil {
+                fixture.viewModel.songEditorDraft.value == null &&
+                    fixture.viewModel.selectedPlaylistContents.value.songs.map(Song::id) == listOf(1L, 2L, 3L)
+            }
+
+            assertEquals("Alpha", fixture.viewModel.selectedPlaylistContents.value.songs.first().artist)
+            assertEquals(listOf(3L, 1L, 2L), fixture.playlists.songIds.value)
+            assertEquals(playback, fixture.player.state.value)
+            assertEquals(0, fixture.player.stopCount)
+
+            fixture.viewModel.updatePlaylistSort(PlaylistSort.ADDED)
+            waitUntil {
+                fixture.viewModel.selectedPlaylistContents.value.songs.map(Song::id) == listOf(3L, 1L, 2L)
+            }
+            assertEquals(playback, fixture.player.state.value)
+        } finally {
+            collection.cancelAndJoin()
+            fixture.clear()
+        }
     }
 
     @Test
@@ -757,8 +1114,10 @@ class MainViewModelInstrumentedTest {
         relocation: SongRelocationCoordinator? = null,
         lyricsResolver: LyricsResolverApi? = null,
         songEditor: SongMetadataEditor? = null,
+        private val preferencesName: String = "view_model_playlist_${UUID.randomUUID()}",
+        val playlists: FakePlaylistStore = FakePlaylistStore(),
     ) {
-        val playlists = FakePlaylistStore()
+        val preferences = PlaylistPreferences(application, preferencesName)
         val lyrics = FakeLyricsStore()
         val player = FakePlaybackController()
         private val store = ViewModelStore()
@@ -779,11 +1138,15 @@ class MainViewModelInstrumentedTest {
                     relocation,
                     lyricsResolver,
                     songEditor,
+                    preferences,
                 ) as T
             },
         )[MainViewModel::class.java]
 
-        fun clear() = store.clear()
+        fun clear(clearPreferences: Boolean = true) {
+            store.clear()
+            if (clearPreferences) application.deleteSharedPreferences(preferencesName)
+        }
     }
 
     private class FakeMusicLibrary(var loader: suspend () -> List<Song>) : MusicLibrary {
@@ -794,10 +1157,23 @@ class MainViewModelInstrumentedTest {
         }
     }
 
-    private class FakePlaylistStore : PlaylistStore {
-        override val playlists = MutableStateFlow<List<PlaylistSummary>>(emptyList())
-        val songIds = MutableStateFlow<List<Long>>(emptyList())
-        val observedPlaylistIds = mutableListOf<Long?>()
+    private class FakePlaylistStore(private val loadGate: CompletableDeferred<Unit>? = null) : PlaylistStore {
+        val summaries = MutableStateFlow(
+            listOf(
+                PlaylistSummary(id = 1L, name = "First", createdAt = 1L, songCount = 0),
+                PlaylistSummary(id = 42L, name = "Selected", createdAt = 2L, songCount = 0),
+            )
+        )
+        override val playlists: Flow<List<PlaylistSummary>> = flow {
+            loadGate?.await()
+            emitAll(summaries)
+        }
+        private val memberships = ConcurrentHashMap<Long, MutableStateFlow<List<Long>>>()
+        val songIdFlows = ConcurrentHashMap<Long, Flow<List<Long>>>()
+        val songIds: MutableStateFlow<List<Long>> get() = songIdsFor(42L)
+        fun songIdsFor(playlistId: Long): MutableStateFlow<List<Long>> =
+            memberships.getOrPut(playlistId) { MutableStateFlow(emptyList()) }
+        val observedPlaylistIds = CopyOnWriteArrayList<Long?>()
         var addResult = true
         var nameFailure: RuntimeException? = null
         var deletedId: Long? = null
@@ -817,17 +1193,18 @@ class MainViewModelInstrumentedTest {
 
         override suspend fun delete(playlistId: Long) {
             deletedId = playlistId
+            summaries.value = summaries.value.filterNot { it.id == playlistId }
         }
 
         override suspend fun addSong(playlistId: Long, songId: Long): Boolean = addResult
         override suspend fun removeSong(playlistId: Long, songId: Long) = Unit
-        override suspend fun getAllSongIds(): List<Long> = songIds.value.distinct()
+        override suspend fun getAllSongIds(): List<Long> = memberships.values.flatMap { it.value }.distinct()
         override suspend fun remapSongIds(remaps: Map<Long, Long>) {
-            songIds.value = songIds.value.map { remaps[it] ?: it }
+            memberships.values.forEach { ids -> ids.value = ids.value.map { remaps[it] ?: it } }
         }
         override fun observeSongIds(playlistId: Long): Flow<List<Long>> {
             observedPlaylistIds += playlistId
-            return songIds
+            return songIdFlows[playlistId] ?: songIdsFor(playlistId)
         }
     }
 
@@ -859,11 +1236,24 @@ class MainViewModelInstrumentedTest {
         override val state: StateFlow<PlaybackUiState> = mutableState
         var releaseCount = 0
         var stopCount = 0
+        var playCalls = 0
+            private set
+        var lastPlayedSongs = emptyList<Song>()
+            private set
+        var lastStartIndex: Int? = null
+            private set
+        var lastSource: PlaybackQueueSource? = null
+            private set
         override fun playQueue(
             songs: List<Song>,
             startIndex: Int,
             source: PlaybackQueueSource,
-        ) = Unit
+        ) {
+            playCalls++
+            lastPlayedSongs = songs.toList()
+            lastStartIndex = startIndex
+            lastSource = source
+        }
         override fun togglePlayPause() = Unit
         override fun stop() {
             stopCount++

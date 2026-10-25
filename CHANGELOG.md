@@ -6,10 +6,19 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- Cold player connections now retain explicit sequential-playback and disabled-mixing choices until the service connects, instead of replacing them with saved service settings.
+- Android UI regressions now wait for the selected list and scroll controls into view on small screens; playback tests establish their own service mode before each case.
+- Android CI now uses ANGLE-based software GLES rendering with the unused Vulkan path disabled, and preserves instrumentation reports even when a device test fails.
+- CI Android SDK initialization now requests `platform-tools` explicitly, avoiding the removed legacy `tools` package before building or running tests.
+- Bound playlist contents to their playlist ID and sort before display or playback, preventing an earlier playlist's cached songs from being used while another playlist loads.
+- Kept restored playlist details, the selected navigation tab and back navigation consistent when Android restores a previously saved library tab.
+- Showed loading, library-read errors and a working retry on restored playlist pages instead of reporting a false empty playlist.
 - Editing playback boundaries for an unplayed queue item now rebuilds its Media3 source as well, so newly added trimming changes the actual audio range while preserving the current song's position and play/pause state.
 
 ### Added
 
+- Added playlist song sorting by added order, title or artist, with title ordering within each artist and a saved playlist sort preference.
+- The app now opens the last visited playlist on launch, keeps that choice after returning to the library or playlist list, and clears missing or deleted playlist references after repository loading.
 - Added non-destructive per-song playback trimming to the existing song editor. Users can retain a start/end range, use the live playback position as the new start, restore the full song, and see effective versus original duration in library and playlist rows.
 - Added Room 3→4 migration coverage plus playback, active-queue refresh, editor, metadata-recovery and range-validation regressions for saved song boundaries.
 
