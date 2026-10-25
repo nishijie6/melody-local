@@ -6,6 +6,9 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- Cold player connections now retain explicit sequential-playback and disabled-mixing choices until the service connects, instead of replacing them with saved service settings.
+- Android UI regressions now wait for the selected list and scroll controls into view on small screens; playback tests establish their own service mode before each case.
+- Android CI now disables the unused emulator Vulkan path while retaining software GLES rendering, and preserves instrumentation reports even when a device test fails.
 - CI Android SDK initialization now requests `platform-tools` explicitly, avoiding the removed legacy `tools` package before building or running tests.
 - Bound playlist contents to their playlist ID and sort before display or playback, preventing an earlier playlist's cached songs from being used while another playlist loads.
 - Kept restored playlist details, the selected navigation tab and back navigation consistent when Android restores a previously saved library tab.

@@ -240,17 +240,27 @@ class PlayerConnection(context: Context) :
     }
 
     override fun setPlaybackMode(mode: PlaybackMode) {
-        if (mode == currentPlaybackMode) return
+        if (controller != null && mode == currentPlaybackMode) return
         currentPlaybackMode = mode
         _state.value = _state.value.copy(playbackMode = mode)
-        withController { player -> sendPlaybackMode(player, mode) }
+        withController { player ->
+            // Initial session extras are read before queued actions run. Restore the explicit
+            // choice here so a following queued playQueue also uses the user's chosen mode.
+            currentPlaybackMode = mode
+            _state.value = _state.value.copy(playbackMode = mode)
+            sendPlaybackMode(player, mode)
+        }
     }
 
     override fun setAudioMixingEnabled(enabled: Boolean) {
-        if (enabled == currentAudioMixingEnabled) return
+        if (controller != null && enabled == currentAudioMixingEnabled) return
         currentAudioMixingEnabled = enabled
         _state.value = _state.value.copy(audioMixingEnabled = enabled)
-        withController { player -> sendAudioMixing(player, enabled) }
+        withController { player ->
+            currentAudioMixingEnabled = enabled
+            _state.value = _state.value.copy(audioMixingEnabled = enabled)
+            sendAudioMixing(player, enabled)
+        }
     }
 
     override fun onExtrasChanged(controller: MediaController, extras: Bundle) {
