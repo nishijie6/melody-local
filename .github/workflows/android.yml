@@ -91,7 +91,7 @@ jobs:
           arch: x86_64
           sdcard-path-or-size: 256M
           disable-animations: true
-          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -feature -Vulkan
+          emulator-options: -no-window -gpu swangle -no-snapshot -noaudio -no-boot-anim -feature -Vulkan
           script: ./gradlew --no-daemon connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.requireSecondaryVolume=true
 
       - name: Upload Android test results
