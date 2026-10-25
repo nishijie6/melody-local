@@ -100,6 +100,8 @@ Room stores playlists in `playlists` and membership in `playlist_songs`. The joi
 
 Playlist names are trimmed, limited to 40 characters and protected by a NOCASE unique Room index. Database migration 1→2 preserves duplicate legacy playlists by assigning deterministic suffixes before adding the index. Migration 2→3 adds `song_overrides`, `move_operations` and `move_items` without rewriting existing playlists or membership. Migration 3→4 adds nullable playback-end and zero-default playback-start columns, so every existing override initially retains full-song playback. Membership uses a `(playlistId, addedAt)` index for ordered reads; ID remapping removes old memberships and inserts their replacements inside one Room transaction, so either the complete mapping commits or the original memberships remain.
 
+`PlaylistPreferences` stores the last opened playlist ID and added/title/artist sort in SharedPreferences, independently of library sorting. Returning to the library or playlist list keeps the remembered ID; deletion clears it. `MainViewModel` validates restored IDs only after a real playlist-directory result and exposes `PlaylistContents` snapshots tagged with playlist ID, sort and loading state. The UI and playlist playback commands reject stale snapshots, so an earlier playlist's songs cannot be displayed or played as a newly selected playlist while its query loads.
+
 ### Lyrics
 
 The automatic path through `LyricsResolver` runs only when a song has no private lyric copy; manual online search can also be requested from the lyric menu. Automatic resolution is deliberately local-first:
@@ -121,6 +123,7 @@ The in-app editor operates on the stored LRC source. It can insert the adjusted 
 Room database            playlist definitions and membership
                          metadata overrides and relocation journal
 SharedPreferences        selected playback mode and opt-in audio-mixing policy
+                         last opened playlist ID and playlist sort
                          active WorkManager/legacy import recovery IDs
                          lyric discovery preferences and persisted SAF tree URIs
                          overlay/notification settings and per-output-route lyric delays
@@ -134,7 +137,7 @@ Android cloud backup and device transfer are disabled for application-private da
 
 ## Error boundaries
 
-- MediaStore failures become a library error shown by the UI.
+- MediaStore failures expose an error and retry in both library and playlist details; loading is distinguished from a genuinely empty playlist.
 - Duplicate playlist names become user-visible Snackbar messages.
 - Invalid or oversized lyric files are rejected without replacing the existing lyric.
 - Missing or low-confidence local lyrics leave the current song unchanged; an unavailable SAF grant is treated as a local-source miss.
