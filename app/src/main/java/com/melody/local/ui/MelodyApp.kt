@@ -211,7 +211,12 @@ fun MelodyApp(
     val visibleSongs by viewModel.visibleSongs.collectAsStateWithLifecycle()
     val allSongs by viewModel.allSongs.collectAsStateWithLifecycle()
     val playlists by viewModel.playlists.collectAsStateWithLifecycle()
-    val playlistSongs by viewModel.selectedPlaylistSongs.collectAsStateWithLifecycle()
+    val openPlaylistId by viewModel.selectedPlaylistId.collectAsStateWithLifecycle()
+    val playlistContents by viewModel.selectedPlaylistContents.collectAsStateWithLifecycle()
+    val playlistSort by viewModel.playlistSort.collectAsStateWithLifecycle()
+    val playlistSongs = playlistContents.takeIf {
+        it.playlistId == openPlaylistId && it.sort == playlistSort
+    }?.songs.orEmpty()
     val playback by viewModel.playback.collectAsStateWithLifecycle()
     val lyrics by viewModel.lyrics.collectAsStateWithLifecycle()
     val lyricsEditorDraft by viewModel.lyricsEditorDraft.collectAsStateWithLifecycle()
@@ -234,9 +239,11 @@ fun MelodyApp(
     val scope = rememberCoroutineScope()
     val systemLyricsSettings = remember { SystemLyricsSettings(context) }
     val snackbarHostState = remember { SnackbarHostState() }
-    var selectedTab by rememberSaveable { mutableStateOf(HomeTab.SONGS) }
+    var selectedTab by rememberSaveable {
+        mutableStateOf(if (viewModel.initialPlaylistId != null) HomeTab.PLAYLISTS else HomeTab.SONGS)
+    }
+    val displayedTab = if (openPlaylistId != null) HomeTab.PLAYLISTS else selectedTab
     var showPlayer by rememberSaveable { mutableStateOf(false) }
-    var openPlaylistId by rememberSaveable { mutableStateOf<Long?>(null) }
     var playlistPickerSong by remember { mutableStateOf<Song?>(null) }
     var showCreateDialog by remember { mutableStateOf(false) }
     var createWithSongId by remember { mutableStateOf<Long?>(null) }
@@ -335,10 +342,6 @@ fun MelodyApp(
     LaunchedEffect(Unit) {
         viewModel.messages.collect { snackbarHostState.showSnackbar(it) }
     }
-    LaunchedEffect(openPlaylistId) {
-        viewModel.selectPlaylist(openPlaylistId)
-    }
-
     if (!hasAudioPermission) {
         PermissionScreen(onRequestPermission = onRequestPermission)
         return
@@ -481,20 +484,20 @@ fun MelodyApp(
                     tonalElevation = 0.dp,
                 ) {
                     NavigationBarItem(
-                        selected = selectedTab == HomeTab.SONGS,
+                        selected = displayedTab == HomeTab.SONGS,
                         onClick = {
                             selectedTab = HomeTab.SONGS
-                            openPlaylistId = null
+                            viewModel.selectPlaylist(null)
                         },
                         icon = { Icon(Icons.Rounded.LibraryMusic, contentDescription = null) },
                         label = { Text("歌曲") },
                         colors = navigationColors(),
                     )
                     NavigationBarItem(
-                        selected = selectedTab == HomeTab.PLAYLISTS,
+                        selected = displayedTab == HomeTab.PLAYLISTS,
                         onClick = {
                             selectedTab = HomeTab.PLAYLISTS
-                            openPlaylistId = null
+                            viewModel.selectPlaylist(null)
                         },
                         icon = { Icon(Icons.AutoMirrored.Rounded.QueueMusic, contentDescription = null) },
                         label = { Text("歌单") },
@@ -513,6 +516,12 @@ fun MelodyApp(
         ) { playlistId ->
             if (playlistId != null) {
                 val summary = playlists.firstOrNull { it.id == playlistId }
+                val contents = playlistContents.takeIf {
+                    it.playlistId == playlistId && it.sort == playlistSort && openPlaylistId == playlistId
+                }
+                val detailSongs = contents?.songs.orEmpty()
+                val detailLoading = contents == null || contents.isLoading ||
+                    (isLoading && allSongs.isEmpty())
                 val queueSource = PlaybackQueueSource.playlist(
                     id = playlistId,
                     name = summary?.name ?: "歌单",
@@ -521,33 +530,41 @@ fun MelodyApp(
                     playback.queueSource,
                     playback.queueItems,
                     queueSource,
-                    playlistSongs,
+                    detailSongs,
                 ) {
-                    playback.matchesVisibleQueue(queueSource, playlistSongs)
+                    playback.matchesVisibleQueue(queueSource, detailSongs)
                 }
                 PlaylistDetailScreen(
                     playlistId = playlistId,
                     title = summary?.name ?: "歌单",
-                    songs = playlistSongs,
+                    songs = detailSongs,
+                    isLoading = detailLoading,
+                    error = libraryError,
+                    onRefresh = viewModel::refreshSongs,
+                    sort = playlistSort,
+                    onSortChange = viewModel::updatePlaylistSort,
                     currentSongId = playback.mediaId,
                     currentQueueMatchesVisible = currentQueueMatchesVisible,
-                    onBack = { openPlaylistId = null },
+                    onBack = {
+                        selectedTab = HomeTab.PLAYLISTS
+                        viewModel.selectPlaylist(null)
+                    },
                     onPlay = { index ->
-                        viewModel.playSongs(playlistSongs, index, queueSource)
+                        contents?.let { viewModel.playPlaylistSongs(it, index, queueSource.name) }
                     },
                     playbackMode = playback.playbackMode,
                     onRandomPlay = {
-                        if (playlistSongs.isNotEmpty()) {
+                        if (contents != null && viewModel.isCurrentPlaylist(contents) && detailSongs.isNotEmpty()) {
                             viewModel.player.setPlaybackMode(PlaybackMode.RANDOM)
-                            viewModel.playSongs(
-                                playlistSongs,
-                                playlistSongs.indices.random(),
-                                queueSource,
-                            )
+                            viewModel.playPlaylistSongs(contents, detailSongs.indices.random(), queueSource.name)
                         }
                     },
                     onAddSongs = { showSongPicker = true },
-                    onRemove = { song -> viewModel.removeSongFromPlaylist(playlistId, song.id) },
+                    onRemove = { song ->
+                        if (contents != null && viewModel.isCurrentPlaylist(contents)) {
+                            viewModel.removeSongFromPlaylist(playlistId, song.id)
+                        }
+                    },
                     onEditSong = viewModel::openSongEditor,
                     onOpenPlayer = { showPlayer = true },
                 )
@@ -601,7 +618,7 @@ fun MelodyApp(
                             createWithSongId = null
                             showCreateDialog = true
                         },
-                        onOpen = { openPlaylistId = it.id },
+                        onOpen = { viewModel.selectPlaylist(it.id) },
                         onRename = { renameTarget = it },
                         onDelete = { deleteTarget = it },
                         onConsolidate = {
@@ -666,7 +683,6 @@ fun MelodyApp(
             confirmButton = {
                 TextButton(
                     onClick = {
-                        if (openPlaylistId == playlist.id) openPlaylistId = null
                         viewModel.deletePlaylist(playlist.id)
                         deleteTarget = null
                     }
@@ -866,31 +882,7 @@ private fun SongsScreen(
             else -> {
                 if (error != null) {
                     item {
-                        Surface(
-                            color = Coral.copy(alpha = 0.12f),
-                            shape = RoundedCornerShape(18.dp),
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(horizontal = 20.dp, vertical = 8.dp)
-                                .testTag("library-refresh-error"),
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(start = 14.dp, end = 6.dp, top = 8.dp, bottom = 8.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                            ) {
-                                Icon(Icons.Rounded.Refresh, contentDescription = null, tint = CoralSoft)
-                                Spacer(Modifier.width(10.dp))
-                                Column(Modifier.weight(1f)) {
-                                    Text("曲库刷新失败", style = MaterialTheme.typography.titleSmall)
-                                    Text(
-                                        "$error；当前显示上次加载结果",
-                                        color = Muted,
-                                        style = MaterialTheme.typography.bodySmall,
-                                    )
-                                }
-                                TextButton(onClick = onRefresh) { Text("重试") }
-                            }
-                        }
+                        LibraryRefreshError(error, onRefresh, Modifier.testTag("library-refresh-error"))
                     }
                 }
                 item {
@@ -925,6 +917,34 @@ private fun SongsScreen(
                     )
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun LibraryRefreshError(error: String, onRefresh: () -> Unit, modifier: Modifier = Modifier) {
+    Surface(
+        color = Coral.copy(alpha = 0.12f),
+        shape = RoundedCornerShape(18.dp),
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(horizontal = 20.dp, vertical = 8.dp),
+    ) {
+        Row(
+            modifier = Modifier.padding(start = 14.dp, end = 6.dp, top = 8.dp, bottom = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(Icons.Rounded.Refresh, contentDescription = null, tint = CoralSoft)
+            Spacer(Modifier.width(10.dp))
+            Column(Modifier.weight(1f)) {
+                Text("曲库刷新失败", style = MaterialTheme.typography.titleSmall)
+                Text(
+                    "$error；当前显示上次加载结果",
+                    color = Muted,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+            TextButton(onClick = onRefresh) { Text("重试") }
         }
     }
 }
@@ -1287,6 +1307,11 @@ private fun PlaylistDetailScreen(
     playlistId: Long,
     title: String,
     songs: List<Song>,
+    isLoading: Boolean,
+    error: String?,
+    onRefresh: () -> Unit,
+    sort: PlaylistSort,
+    onSortChange: (PlaylistSort) -> Unit,
     currentSongId: Long?,
     currentQueueMatchesVisible: Boolean,
     playbackMode: PlaybackMode,
@@ -1330,7 +1355,7 @@ private fun PlaylistDetailScreen(
                 Spacer(Modifier.height(18.dp))
                 Text(title, style = MaterialTheme.typography.headlineLarge)
                 Spacer(Modifier.height(5.dp))
-                Text("${songs.size} 首歌曲", color = Muted)
+                Text(if (isLoading && songs.isEmpty()) "正在加载…" else "${songs.size} 首歌曲", color = Muted)
                 Spacer(Modifier.height(18.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     Button(
@@ -1354,14 +1379,46 @@ private fun PlaylistDetailScreen(
                         Spacer(Modifier.width(6.dp))
                         Text("随机播放")
                     }
-                    FilledIconButton(onClick = onAddSongs) {
+                    FilledIconButton(enabled = !isLoading, onClick = onAddSongs) {
                         Icon(Icons.Rounded.Add, contentDescription = "添加歌曲")
                     }
                 }
                 Spacer(Modifier.height(14.dp))
             }
         }
-        if (songs.isEmpty()) {
+        item {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("playlist-sort")
+                    .padding(horizontal = 20.dp, vertical = 12.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Icon(
+                    Icons.AutoMirrored.Rounded.Sort,
+                    contentDescription = null,
+                    tint = Muted,
+                    modifier = Modifier.size(18.dp),
+                )
+                SortChip("加入顺序", sort == PlaylistSort.ADDED) { onSortChange(PlaylistSort.ADDED) }
+                SortChip("标题", sort == PlaylistSort.TITLE) { onSortChange(PlaylistSort.TITLE) }
+                SortChip("歌手", sort == PlaylistSort.ARTIST) { onSortChange(PlaylistSort.ARTIST) }
+            }
+        }
+        if (isLoading && songs.isEmpty()) {
+            item { LoadingState("正在加载歌单…") }
+        } else if (error != null && songs.isEmpty()) {
+            item {
+                MessageState(
+                    icon = Icons.Rounded.Refresh,
+                    title = "曲库加载失败",
+                    message = error,
+                    actionLabel = "重试",
+                    onAction = onRefresh,
+                )
+            }
+        } else if (songs.isEmpty()) {
             item {
                 MessageState(
                     icon = Icons.AutoMirrored.Rounded.PlaylistAdd,
@@ -1372,6 +1429,9 @@ private fun PlaylistDetailScreen(
                 )
             }
         } else {
+            if (error != null) {
+                item { LibraryRefreshError(error, onRefresh, Modifier.testTag("playlist-refresh-error")) }
+            }
             itemsIndexed(songs, key = { _, song -> song.id }) { index, song ->
                 SongRow(
                     song = song,

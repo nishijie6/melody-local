@@ -2,8 +2,10 @@ package com.melody.local.ui
 
 import android.app.Application
 import android.net.Uri
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.assertIsNotSelected
 import androidx.compose.ui.test.assertIsSelected
 import androidx.compose.ui.test.assertTextEquals
@@ -11,6 +13,7 @@ import androidx.compose.ui.test.hasAnyDescendant
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.junit4.StateRestorationTester
 import androidx.compose.ui.test.onAllNodesWithTag
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithTag
@@ -35,15 +38,20 @@ import com.melody.local.playback.PlaybackQueueItem
 import com.melody.local.playback.PlaybackQueueSource
 import com.melody.local.playback.PlaybackUiState
 import com.melody.local.ui.theme.MelodyTheme
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.flow
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
+import java.io.IOException
+import java.util.UUID
 
 @RunWith(AndroidJUnit4::class)
 class MelodyAppPlaylistQueueTest {
@@ -72,7 +80,7 @@ class MelodyAppPlaylistQueueTest {
         compose.onNodeWithText("歌单").performClick()
         compose.onNodeWithText(PLAYLIST_NAME).performClick()
         compose.waitUntil(timeoutMillis = 5_000L) {
-            fixture.viewModel.selectedPlaylistSongs.value.map(Song::id) ==
+            fixture.viewModel.selectedPlaylistContents.value.songs.map(Song::id) ==
                 listOf(first.id, second.id)
         }
 
@@ -125,6 +133,218 @@ class MelodyAppPlaylistQueueTest {
         compose.onNodeWithText(PLAYLIST_NAME).assertIsDisplayed()
         compose.onNodeWithText("2 首歌曲").assertIsDisplayed()
         compose.onNodeWithContentDescription("返回").assertIsDisplayed()
+    }
+
+    @Test
+    fun playlistArtistSortingChangesVisibleAndNewPlaybackOrderWithoutReplacingTheActiveQueue() {
+        val first = song(101L, "先加入的歌").copy(artist = "Zulu")
+        val second = song(102L, "后加入的歌").copy(artist = "Alpha")
+        fixture = Fixture(
+            librarySongs = listOf(first, second),
+            playlistSongIds = listOf(first.id, second.id),
+        )
+        setContentAndLoad()
+        compose.onNodeWithText("歌单").performClick()
+        compose.onNodeWithText(PLAYLIST_NAME).performClick()
+        compose.onNodeWithTag("playlist-song-${first.id}").performClick()
+        compose.runOnIdle { fixture.player.pauseForTest() }
+
+        compose.onNodeWithText("歌手").performClick()
+        compose.waitUntil(timeoutMillis = 5_000L) {
+            fixture.viewModel.selectedPlaylistContents.value.songs.map(Song::id) == listOf(second.id, first.id)
+        }
+        compose.onNodeWithText("歌手").assertIsSelected()
+        val firstBounds = compose.onNodeWithTag("playlist-song-${first.id}").fetchSemanticsNode().boundsInRoot
+        val secondBounds = compose.onNodeWithTag("playlist-song-${second.id}").fetchSemanticsNode().boundsInRoot
+        assertTrue(secondBounds.top < firstBounds.top)
+        compose.runOnIdle {
+            assertEquals(1, fixture.player.queueReplacementCount)
+            assertEquals(listOf(first.id, second.id), fixture.player.state.value.queueItems.map { it.mediaId })
+            assertFalse(fixture.player.state.value.isPlaying)
+        }
+
+        compose.onNodeWithTag("playlist-song-${second.id}").performClick()
+        compose.runOnIdle {
+            assertEquals(2, fixture.player.queueReplacementCount)
+            assertEquals(listOf(second.id, first.id), fixture.player.state.value.queueItems.map { it.mediaId })
+            assertEquals(second.id, fixture.player.state.value.mediaId)
+        }
+    }
+
+    @Test
+    fun launchOpensTheRememberedPlaylistWithItsSavedSortAndBackShowsThePlaylistList() {
+        val first = song(101L, "先加入的歌").copy(artist = "Zulu")
+        val second = song(102L, "后加入的歌").copy(artist = "Alpha")
+        fixture = Fixture(
+            librarySongs = listOf(first, second),
+            playlistSongIds = listOf(first.id, second.id),
+            rememberedPlaylistId = PLAYLIST_ID,
+            restoredSort = PlaylistSort.ARTIST,
+        )
+        setContentAndLoad()
+        compose.waitUntil(timeoutMillis = 5_000L) {
+            fixture.viewModel.selectedPlaylistContents.value.songs.map(Song::id) == listOf(second.id, first.id)
+        }
+        compose.onNodeWithText(PLAYLIST_NAME).assertIsDisplayed()
+        compose.onNodeWithText("歌手").assertIsSelected()
+        compose.onNodeWithContentDescription("返回").performClick()
+        compose.onNodeWithText("我的歌单").assertIsDisplayed()
+        compose.onNodeWithText(PLAYLIST_NAME).assertIsDisplayed()
+        compose.runOnIdle {
+            assertEquals(PLAYLIST_ID, fixture.preferences.lastOpenedPlaylistId)
+            assertEquals(0, fixture.player.queueReplacementCount)
+        }
+    }
+
+    @Test
+    fun switchingToASlowPlaylistDoesNotExposeOrPlayThePreviousPlaylistsSongs() {
+        val first = song(101L, "仅属于旧歌单")
+        val second = song(102L, "仅属于新歌单")
+        fixture = Fixture(listOf(first, second), listOf(first.id))
+        setContentAndLoad()
+        compose.onNodeWithText("歌单").performClick()
+        compose.onNodeWithText(PLAYLIST_NAME).performClick()
+        compose.waitUntil(timeoutMillis = 5_000L) {
+            fixture.viewModel.selectedPlaylistContents.value.songs.map(Song::id) == listOf(first.id)
+        }
+
+        val loaded = CompletableDeferred<Unit>()
+        val secondPlaylistId = PLAYLIST_ID + 1L
+        compose.runOnIdle {
+            fixture.playlists.songFlows[secondPlaylistId] = flow {
+                loaded.await()
+                emit(listOf(second.id))
+            }
+            fixture.playlists.playlists.value += PlaylistSummary(
+                id = secondPlaylistId,
+                name = "慢加载歌单",
+                createdAt = 2L,
+                songCount = 1,
+            )
+            fixture.viewModel.selectPlaylist(secondPlaylistId)
+        }
+        compose.onNodeWithText("慢加载歌单").assertIsDisplayed()
+        compose.onAllNodesWithTag("playlist-song-${first.id}").assertCountEquals(0)
+        compose.onNodeWithText("播放").assertIsNotEnabled()
+        compose.onNodeWithText("歌手").performClick()
+        compose.onAllNodesWithTag("playlist-song-${first.id}").assertCountEquals(0)
+        compose.runOnIdle { assertEquals(0, fixture.player.queueReplacementCount) }
+
+        loaded.complete(Unit)
+        compose.waitUntil(timeoutMillis = 5_000L) {
+            fixture.viewModel.selectedPlaylistContents.value.songs.map(Song::id) == listOf(second.id)
+        }
+        compose.onNodeWithTag("playlist-song-${second.id}").performClick()
+        compose.runOnIdle {
+            assertEquals(listOf(second.id), fixture.player.state.value.queueItems.map { it.mediaId })
+            assertEquals(
+                PlaybackQueueSource.playlist(secondPlaylistId, "慢加载歌单"),
+                fixture.player.state.value.queueSource,
+            )
+        }
+    }
+
+    @Test
+    fun restoringASavedLibraryTabWithANewViewModelKeepsPlaylistNavigationConsistent() {
+        val first = song(101L, "恢复测试歌曲")
+        val preferencesName = "playlist_saved_tab_${UUID.randomUUID()}"
+        fixture = Fixture(listOf(first), listOf(first.id), preferencesName = preferencesName)
+        val activeViewModel = mutableStateOf(fixture.viewModel)
+        val restoration = StateRestorationTester(compose)
+        restoration.setContent {
+            MelodyTheme {
+                MelodyApp(activeViewModel.value, hasAudioPermission = true, onRequestPermission = {})
+            }
+        }
+        compose.runOnIdle { fixture.viewModel.refreshSongs() }
+        compose.waitUntil(timeoutMillis = 5_000L) { fixture.viewModel.allSongs.value.isNotEmpty() }
+        compose.onNodeWithText("歌单").performClick()
+        compose.onNodeWithText(PLAYLIST_NAME).performClick()
+        compose.onNodeWithText("歌曲").performClick()
+        compose.onNodeWithText("我的音乐").assertIsDisplayed()
+
+        compose.runOnIdle {
+            fixture.clear(clearPreferences = false)
+            fixture = Fixture(listOf(first), listOf(first.id), preferencesName = preferencesName)
+            activeViewModel.value = fixture.viewModel
+            fixture.viewModel.refreshSongs()
+        }
+        restoration.emulateSavedInstanceStateRestore()
+        compose.onNodeWithText(PLAYLIST_NAME).assertIsDisplayed()
+        compose.onNodeWithText("歌单").assertIsSelected()
+        compose.onNodeWithText("歌曲").assertIsNotSelected()
+        compose.onNodeWithContentDescription("返回").performClick()
+        compose.onNodeWithText("我的歌单").assertIsDisplayed()
+    }
+
+    @Test
+    fun restoredPlaylistShowsLoadingAndAWorkingRetryInsteadOfAFakeEmptyState() {
+        val first = song(101L, "重试后恢复的歌")
+        val loaded = CompletableDeferred<List<Song>>()
+        fixture = Fixture(listOf(first), listOf(first.id), rememberedPlaylistId = PLAYLIST_ID)
+        fixture.music.loadGate = loaded
+        compose.setContent {
+            MelodyTheme {
+                MelodyApp(fixture.viewModel, hasAudioPermission = true, onRequestPermission = {})
+            }
+        }
+        try {
+            compose.runOnIdle { fixture.viewModel.refreshSongs() }
+            compose.waitUntil(timeoutMillis = 5_000L) { fixture.viewModel.isLoading.value }
+            compose.onNodeWithText("正在加载歌单…").assertIsDisplayed()
+            compose.onAllNodes(hasText("歌单还是空的")).assertCountEquals(0)
+
+            loaded.completeExceptionally(IOException("MediaStore unavailable"))
+            compose.waitUntil(timeoutMillis = 5_000L) { fixture.viewModel.libraryError.value != null }
+            compose.onNodeWithText("曲库加载失败").assertIsDisplayed()
+            compose.onAllNodes(hasText("歌单还是空的")).assertCountEquals(0)
+            compose.runOnIdle { fixture.music.loadGate = null }
+            compose.onNodeWithText("重试").performClick()
+            compose.waitUntil(timeoutMillis = 5_000L) {
+                fixture.viewModel.selectedPlaylistContents.value.songs.map(Song::id) == listOf(first.id)
+            }
+            compose.onNodeWithTag("playlist-song-${first.id}").assertIsDisplayed()
+
+            compose.runOnIdle {
+                fixture.music.failure = IOException("refresh failure")
+                fixture.viewModel.refreshSongs()
+            }
+            compose.waitUntil(timeoutMillis = 5_000L) { fixture.viewModel.libraryError.value != null }
+            compose.onNodeWithTag("playlist-refresh-error").assertIsDisplayed()
+            compose.onNodeWithTag("playlist-song-${first.id}").assertIsDisplayed()
+            compose.runOnIdle { fixture.music.failure = null }
+            compose.onNodeWithText("重试").performClick()
+            compose.waitUntil(timeoutMillis = 5_000L) { fixture.viewModel.libraryError.value == null }
+            compose.onAllNodesWithTag("playlist-refresh-error").assertCountEquals(0)
+        } finally {
+            loaded.complete(emptyList())
+        }
+    }
+
+    @Test
+    fun tappingTheCurrentSongAfterSortingStartsTheNewOrderBeforeOpeningThePlayer() {
+        val first = song(101L, "当前歌曲").copy(artist = "Zulu")
+        val second = song(102L, "排序后第一首").copy(artist = "Alpha")
+        fixture = Fixture(listOf(first, second), listOf(first.id, second.id))
+        setContentAndLoad()
+        compose.onNodeWithText("歌单").performClick()
+        compose.onNodeWithText(PLAYLIST_NAME).performClick()
+        compose.onNodeWithTag("playlist-song-${first.id}").performClick()
+        compose.runOnIdle { fixture.player.pauseForTest() }
+        compose.onNodeWithText("歌手").performClick()
+        compose.waitUntil(timeoutMillis = 5_000L) {
+            fixture.viewModel.selectedPlaylistContents.value.songs.map(Song::id) == listOf(second.id, first.id)
+        }
+        compose.onNodeWithTag("playlist-song-${first.id}").performClick()
+        compose.runOnIdle {
+            assertEquals(2, fixture.player.queueReplacementCount)
+            assertEquals(listOf(second.id, first.id), fixture.player.state.value.queueItems.map { it.mediaId })
+            assertEquals(1, fixture.player.state.value.queueIndex)
+            fixture.player.pauseForTest()
+        }
+        compose.onNodeWithTag("playlist-song-${first.id}").performClick()
+        compose.onNodeWithTag("now-playing-source").assertTextEquals("来自歌单：$PLAYLIST_NAME")
+        compose.runOnIdle { assertEquals(2, fixture.player.queueReplacementCount) }
     }
 
     @Test
@@ -370,7 +590,14 @@ class MelodyAppPlaylistQueueTest {
     private inner class Fixture(
         librarySongs: List<Song>,
         playlistSongIds: List<Long>,
+        rememberedPlaylistId: Long? = null,
+        restoredSort: PlaylistSort? = null,
+        private val preferencesName: String = "playlist_ui_${UUID.randomUUID()}",
     ) {
+        val preferences = PlaylistPreferences(application, preferencesName).apply {
+            if (rememberedPlaylistId != null) lastOpenedPlaylistId = rememberedPlaylistId
+            if (restoredSort != null) sort = restoredSort
+        }
         val expectedSongCount = librarySongs.size
         val playlists = FakePlaylistStore(playlistSongIds)
         val player = FakePlaybackController()
@@ -389,19 +616,24 @@ class MelodyAppPlaylistQueueTest {
                     playlistRepository = playlists,
                     lyricsRepository = EmptyLyricsStore,
                     player = player,
+                    playlistPreferences = preferences,
                 ) as T
             },
         )[MainViewModel::class.java]
 
-        fun clear() = store.clear()
+        fun clear(clearPreferences: Boolean = true) {
+            store.clear()
+            if (clearPreferences) application.deleteSharedPreferences(preferencesName)
+        }
     }
 
     private class FakeMusicLibrary(private val songs: List<Song>) : MusicLibrary {
         var failure: Exception? = null
+        var loadGate: CompletableDeferred<List<Song>>? = null
 
         override suspend fun loadSongs(): List<Song> {
             failure?.let { throw it }
-            return songs
+            return loadGate?.await() ?: songs
         }
     }
 
@@ -417,13 +649,15 @@ class MelodyAppPlaylistQueueTest {
             )
         )
         private val playlistSongIds = MutableStateFlow(songIds)
+        val songFlows = mutableMapOf<Long, Flow<List<Long>>>(PLAYLIST_ID to playlistSongIds)
 
         override suspend fun create(name: String): Long = PLAYLIST_ID
         override suspend fun rename(playlistId: Long, name: String) = Unit
         override suspend fun delete(playlistId: Long) = Unit
         override suspend fun addSong(playlistId: Long, songId: Long): Boolean = false
         override suspend fun removeSong(playlistId: Long, songId: Long) = Unit
-        override fun observeSongIds(playlistId: Long): Flow<List<Long>> = playlistSongIds
+        override fun observeSongIds(playlistId: Long): Flow<List<Long>> =
+            songFlows[playlistId] ?: flow { emit(emptyList()) }
         override suspend fun getAllSongIds(): List<Long> = playlistSongIds.value
         override suspend fun remapSongIds(remaps: Map<Long, Long>) = Unit
     }

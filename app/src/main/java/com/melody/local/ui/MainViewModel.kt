@@ -58,6 +58,8 @@ import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.onEach
+import kotlinx.coroutines.flow.onStart
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -96,6 +98,25 @@ enum class SongSort {
     RECENT,
 }
 
+enum class PlaylistSort {
+    ADDED,
+    TITLE,
+    ARTIST,
+}
+
+internal fun sortPlaylistSongs(songs: List<Song>, sort: PlaylistSort): List<Song> = when (sort) {
+    PlaylistSort.ADDED -> songs
+    PlaylistSort.TITLE -> filterAndSortSongs(songs, "", SongSort.TITLE)
+    PlaylistSort.ARTIST -> filterAndSortSongs(songs, "", SongSort.ARTIST)
+}
+
+data class PlaylistContents(
+    val playlistId: Long? = null,
+    val sort: PlaylistSort = PlaylistSort.ADDED,
+    val songs: List<Song> = emptyList(),
+    val isLoading: Boolean = false,
+)
+
 sealed interface LyricsUiState {
     data object NoSong : LyricsUiState
     data object Loading : LyricsUiState
@@ -130,6 +151,7 @@ class MainViewModel internal constructor(
     private val songRelocationCoordinator: SongRelocationCoordinator? = null,
     private val lyricsResolver: LyricsResolverApi? = null,
     private val songMetadataEditor: SongMetadataEditor? = null,
+    private val playlistPreferences: PlaylistPreferences = PlaylistPreferences(application),
 ) : AndroidViewModel(application) {
     private constructor(application: Application, services: ProductionServices) : this(
         application = application,
@@ -171,20 +193,49 @@ class MainViewModel internal constructor(
         .flowOn(Dispatchers.Default)
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
-    val playlists: StateFlow<List<PlaylistSummary>> = playlistRepository.playlists
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+    val initialPlaylistId: Long? = playlistPreferences.lastOpenedPlaylistId
+    private val _selectedPlaylistId = MutableStateFlow(initialPlaylistId)
+    val selectedPlaylistId: StateFlow<Long?> = _selectedPlaylistId.asStateFlow()
 
-    private val selectedPlaylistId = MutableStateFlow<Long?>(null)
-    val selectedPlaylistSongs: StateFlow<List<Song>> = selectedPlaylistId
-        .flatMapLatest { playlistId ->
-            if (playlistId == null) flowOf(emptyList())
-            else playlistRepository.observeSongIds(playlistId)
+    private val _playlistSort = MutableStateFlow(playlistPreferences.sort)
+    val playlistSort: StateFlow<PlaylistSort> = _playlistSort.asStateFlow()
+
+    val playlists: StateFlow<List<PlaylistSummary>> = playlistRepository.playlists
+        .onEach { available ->
+            // Validate only real repository results, never stateIn's initial empty list.
+            val rememberedId = playlistPreferences.lastOpenedPlaylistId
+            if (rememberedId != null && available.none { it.id == rememberedId }) {
+                playlistPreferences.lastOpenedPlaylistId = null
+            }
+            val selectedId = _selectedPlaylistId.value
+            if (selectedId != null && available.none { it.id == selectedId }) {
+                _selectedPlaylistId.compareAndSet(selectedId, null)
+            }
         }
-        .combine(_allSongs) { ids, songs ->
-            val songsById = songs.associateBy { it.id }
-            ids.mapNotNull(songsById::get)
+        .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
+    val selectedPlaylistContents: StateFlow<PlaylistContents> = combine(
+        _selectedPlaylistId,
+        _playlistSort,
+    ) { playlistId, sort -> playlistId to sort }
+        .flatMapLatest { (playlistId, sort) ->
+            if (playlistId == null) {
+                flowOf(PlaylistContents(sort = sort))
+            } else {
+                playlistRepository.observeSongIds(playlistId)
+                    .combine(_allSongs) { ids, songs ->
+                        val songsById = songs.associateBy { it.id }
+                        PlaylistContents(
+                            playlistId = playlistId,
+                            sort = sort,
+                            songs = sortPlaylistSongs(ids.mapNotNull(songsById::get), sort),
+                        )
+                    }
+                    .onStart { emit(PlaylistContents(playlistId, sort, isLoading = true)) }
+            }
         }
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+        .flowOn(Dispatchers.Default)
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), PlaylistContents())
 
     private val lyricRevision = MutableStateFlow(0)
     val lyrics: StateFlow<LyricsUiState> = combine(
@@ -452,14 +503,34 @@ class MainViewModel internal constructor(
         _sort.value = value
     }
 
+    fun updatePlaylistSort(value: PlaylistSort) {
+        playlistPreferences.sort = value
+        _playlistSort.value = value
+    }
+
     fun playSongs(
         songs: List<Song>,
         startIndex: Int,
         source: PlaybackQueueSource = PlaybackQueueSource.library(),
     ) = player.playQueue(songs, startIndex, source)
 
+    internal fun isCurrentPlaylist(contents: PlaylistContents): Boolean =
+        contents.playlistId != null && !contents.isLoading &&
+            _selectedPlaylistId.value == contents.playlistId && _playlistSort.value == contents.sort &&
+            selectedPlaylistContents.value === contents
+
+    fun playPlaylistSongs(contents: PlaylistContents, startIndex: Int, name: String) {
+        if (!isCurrentPlaylist(contents)) return
+        player.playQueue(
+            contents.songs,
+            startIndex,
+            PlaybackQueueSource.playlist(requireNotNull(contents.playlistId), name),
+        )
+    }
+
     fun selectPlaylist(playlistId: Long?) {
-        selectedPlaylistId.value = playlistId
+        if (playlistId != null) playlistPreferences.lastOpenedPlaylistId = playlistId
+        _selectedPlaylistId.value = playlistId
     }
 
     fun createPlaylist(name: String, songIdToAdd: Long? = null) {
@@ -490,7 +561,10 @@ class MainViewModel internal constructor(
     fun deletePlaylist(playlistId: Long) {
         viewModelScope.launch {
             playlistRepository.delete(playlistId)
-            if (selectedPlaylistId.value == playlistId) selectedPlaylistId.value = null
+            _selectedPlaylistId.compareAndSet(playlistId, null)
+            if (playlistPreferences.lastOpenedPlaylistId == playlistId) {
+                playlistPreferences.lastOpenedPlaylistId = null
+            }
             _messages.emit("歌单已删除")
         }
     }
