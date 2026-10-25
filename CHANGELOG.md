@@ -6,6 +6,7 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- CI Android SDK initialization now requests `platform-tools` explicitly, avoiding the removed legacy `tools` package before building or running tests.
 - Bound playlist contents to their playlist ID and sort before display or playback, preventing an earlier playlist's cached songs from being used while another playlist loads.
 - Kept restored playlist details, the selected navigation tab and back navigation consistent when Android restores a previously saved library tab.
 - Showed loading, library-read errors and a working retry on restored playlist pages instead of reporting a false empty playlist.
